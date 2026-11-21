@@ -9,6 +9,7 @@
 
 const path = require('path');
 const Docker = require('dockerode');
+const { resolveSandboxImage } = require('./sandboxImages');
 
 class SandboxSecurity {
   constructor() {
@@ -47,10 +48,9 @@ async createIsolatedContainer(userId, workspaceId, options = {}) {
      if (!/^[a-zA-Z0-9_-]{1,64}$/.test(String(userId)) || !/^[a-zA-Z0-9_-]{1,64}$/.test(String(workspaceId))) throw new Error('Invalid userId/workspaceId');
      if (!this.docker) throw new Error('Docker not available');
 
-     const image = options.image || 'node:18-alpine';
-     if (!/^[a-zA-Z0-9][a-zA-Z0-9._/-]*(?::[a-zA-Z0-9._-]+)?$/.test(image)) {
-       throw new Error('Invalid sandbox image');
-     }
+     // Allowlisted images only: a caller-supplied registry reference would let
+     // an attacker run a backdoored image with the workspace mounted.
+     const image = resolveSandboxImage(options.image);
 
      try {
       // Reuse a running container only when it was built from the requested

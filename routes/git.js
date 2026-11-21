@@ -130,7 +130,7 @@ async function requireWorkspaceAccess(req, res, next) {
  *       500:
  *         description: Internal server error
  */
-router.post('/init', authenticateToken, requireGitAccess, async (req, res) => {
+router.post('/init', authenticateToken, requireGitAccess, permissionMatrix.requirePermission('git', 'commit'), async (req, res) => {
   try {
     const { workspaceId, userName, userEmail } = req.body;
 
@@ -257,7 +257,7 @@ router.get('/diff/:workspaceId', authenticateToken, requireGitAccess, permission
  *       500:
  *         description: Internal server error
  */
-router.post('/add', authenticateToken, requireGitAccess, async (req, res) => {
+router.post('/add', authenticateToken, requireGitAccess, permissionMatrix.requirePermission('git', 'commit'), async (req, res) => {
   try {
     const { workspaceId, files } = req.body;
 
@@ -308,7 +308,7 @@ router.post('/add', authenticateToken, requireGitAccess, async (req, res) => {
  *       500:
  *         description: Internal server error
  */
-router.post('/reset', authenticateToken, requireGitAccess, async (req, res) => {
+router.post('/reset', authenticateToken, requireGitAccess, permissionMatrix.requirePermission('git', 'commit'), async (req, res) => {
   try {
     const { workspaceId, files } = req.body;
 
@@ -550,7 +550,7 @@ router.post('/branch', authenticateToken, requireGitAccess, permissionMatrix.req
  *       500:
  *         description: Internal server error
  */
-router.post('/checkout', authenticateToken, requireGitAccess, async (req, res) => {
+router.post('/checkout', authenticateToken, requireGitAccess, permissionMatrix.requirePermission('git', 'branch'), async (req, res) => {
   try {
     const { workspaceId, branchName } = req.body;
 
@@ -599,12 +599,21 @@ router.post('/checkout', authenticateToken, requireGitAccess, async (req, res) =
  *       500:
  *         description: Internal server error
  */
-router.post('/merge', authenticateToken, requireGitAccess, async (req, res) => {
+router.post('/merge', authenticateToken, requireGitAccess, permissionMatrix.requirePermission('git', 'merge'), async (req, res) => {
   try {
     const { workspaceId, branchName } = req.body;
 
     if (!workspaceId || !branchName) {
       return res.status(400).json({ error: 'workspaceId and branchName are required' });
+    }
+
+    // Agent branches carry AI-authored changes and are merged only after the
+    // approval flow (agentApprovalService). A direct REST merge would skip the
+    // approval gate, the spec verification and the change-set audit trail.
+    if (/^agent\//.test(String(branchName))) {
+      return res.status(403).json({
+        error: 'Agent branches must be merged through the approval flow'
+      });
     }
 
     const result = await gitService.merge(workspaceId, branchName, req.gitProjectId);
