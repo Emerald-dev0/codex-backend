@@ -10,12 +10,13 @@ import * as editorDrafts from '../lib/editorDrafts';
 import { registerEditorSnippets } from '../lib/monacoExtras';
 import { normalizeMarkers, countProblems, setRunProblems } from '../lib/monacoDiagnostics';
 import { startRun, streamRun, runLanguageFor } from '../lib/ideRun';
+import { startProjectPreview, stopProjectPreview } from '../lib/runtime/projectPreview';
 import { lspApi, docUri, lspKindToMonaco, lspRangeToMonaco } from '../lib/lspClient';
 import {
-  Save, ChevronDown, ChevronRight, FileCode, Terminal, Bot, Layers, Rocket, Box,
+  Save, ArrowLeft, ChevronDown, ChevronRight, FileCode, Terminal, Bot, Layers, Rocket,
   Users, GitBranch, Eye, Bug, X, FolderOpen, Search, Folder, Trash2,
   FolderPlus, AlertCircle, CheckCircle, XCircle, RefreshCw, Puzzle, HelpCircle,
-  FilePlus, Play, Loader2, GitPullRequestArrow, Copy, GitCommit, Plus, Minus,
+  FilePlus, Play, Loader2, GitPullRequestArrow, Copy, GitCommit, Plus, Minus, Sparkles, ArrowUp,
 } from 'lucide-react';
 import MonacoEditor from '@monaco-editor/react';
 import { io } from 'socket.io-client';
@@ -35,6 +36,142 @@ function tierBadgeClass(t) {
   if (n === 'enterprise') return '';
   if (n === 'developer') return 'is-free';
   return 'is-pro';
+}
+
+function formatEditorRelativeTime(value) {
+  if (!value) return '';
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return '';
+  const minutes = Math.max(0, Math.floor((Date.now() - timestamp) / 60000));
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? '' : 's'} ago`;
+}
+
+function parseAssistantAnswer(value) {
+  const text = String(value || '').trim();
+  const legacyPayload = parseLegacyActionPayload(text);
+  if (legacyPayload) {
+    const files = legacyPayload.actions.flatMap((action) => {
+      const type = action?.action || action?.type;
+      if (type === 'create_multiple_files' && Array.isArray(action.files)) {
+        return action.files.map((file) => [file.path, file.name].filter(Boolean).join('/').replace(/\/{2,}/g, '/'));
+      }
+      if (type === 'create_file') {
+        return [[action.path, action.name].filter(Boolean).join('/').replace(/\/{2,}/g, '/')];
+      }
+      if (type === 'update_current_file' || type === 'update_file') {
+        return [action.path || action.filePath || action.name || 'Active file'];
+      }
+      return [];
+    }).filter(Boolean);
+
+    return {
+      summary: typeof legacyPayload.message === 'string' && legacyPayload.message.trim()
+        ? legacyPayload.message
+        : 'Here is a readable summary of the response:',
+      test: null,
+      sections: files.length ? [{ title: 'Files mentioned', content: '', items: files, codeBlocks: [] }] : [],
+    };
+  }
+
+  const answer = { summary: '', test: null, sections: [] };
+  let activeSection = null;
+  let activeCodeBlock = null;
+  const cleanInlineMarkdown = (line) => line
+    .replace(/\*\*(.+?)\*\*/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .trim();
+  const createSection = (title, content = '') => {
+    activeSection = { title, content, items: [], codeBlocks: [] };
+    answer.sections.push(activeSection);
+    return activeSection;
+  };
+  const appendText = (line) => {
+    if (activeSection) {
+      activeSection.content = `${activeSection.content}${activeSection.content ? '\n' : ''}${line}`;
+    } else {
+      answer.summary = `${answer.summary}${answer.summary ? '\n' : ''}${line}`;
+    }
+  };
+
+  String(value || '').split(/\r?\n/).forEach((rawLine) => {
+    const fence = rawLine.trim().match(/^```([\w+-]*)\s*$/);
+    if (fence) {
+      if (activeCodeBlock) {
+        activeCodeBlock = null;
+      } else {
+        if (!activeSection || !activeSection.codeBlocks) createSection('Code example');
+        activeCodeBlock = { language: fence[1] || '', content: '' };
+        activeSection.codeBlocks.push(activeCodeBlock);
+      }
+      return;
+    }
+    if (activeCodeBlock) {
+      activeCodeBlock.content += `${activeCodeBlock.content ? '\n' : ''}${rawLine}`;
+      return;
+    }
+
+    const boldHeading = rawLine.trim().match(/^\*\*(.+?)\*\*:?\s*$/);
+    if (boldHeading) {
+      createSection(boldHeading[1]);
+      return;
+    }
+
+    const line = cleanInlineMarkdown(rawLine);
+    if (!line) {
+      if (activeSection?.content && !activeSection.content.endsWith('\n')) activeSection.content += '\n';
+      else if (!activeSection && answer.summary && !answer.summary.endsWith('\n')) answer.summary += '\n';
+      return;
+    }
+
+    const markdownHeading = line.match(/^#{1,6}\s+(.+?)\s*#*$/);
+    if (markdownHeading) {
+      createSection(markdownHeading[1]);
+      return;
+    }
+
+    const labeledHeading = line.match(/^(failing test|test|likely cause|what to check|next steps)\s*:?\s*(.*)$/i);
+    if (labeledHeading) {
+      const label = labeledHeading[1].toLowerCase();
+      const detail = labeledHeading[2].trim();
+      if (label === 'test' || label === 'failing test') {
+        const test = detail.match(/^(.+\.(?:test|spec)\.[cm]?[jt]sx?)\s*[-:–—]\s*(.+)$/i);
+        answer.test = test ? { file: test[1], detail: test[2] } : { file: '', detail };
+        activeSection = null;
+      } else {
+        createSection(label === 'next steps' ? 'What to check' : labeledHeading[1], detail);
+      }
+      return;
+    }
+
+    const headingWithDetail = line.match(/^([A-Z][^:]{1,48}):\s+(.+)$/);
+    if (headingWithDetail && !/[.!?]$/.test(headingWithDetail[1])) {
+      createSection(headingWithDetail[1], headingWithDetail[2]);
+      return;
+    }
+
+    const testLine = line.match(/^(.+\.(?:test|spec)\.[cm]?[jt]sx?)\s*[-:–—]\s*(.+)$/i);
+    if (!answer.test && testLine) {
+      answer.test = { file: testLine[1], detail: testLine[2] };
+      activeSection = null;
+      return;
+    }
+
+    const bullet = line.match(/^\s*(?:[-*+]|\d+[.)])\s+(.+)$/);
+    if (bullet) {
+      if (!activeSection) createSection('Details');
+      activeSection.items.push(cleanInlineMarkdown(bullet[1]));
+      return;
+    }
+
+    appendText(line.replace(/^\s*>\s?/, ''));
+  });
+
+  return answer;
 }
 
 // --- ANSI output handling (run output can carry terminal color codes) -------
@@ -239,6 +376,11 @@ function fileFullPath(f) {
   return `${base}/${name}`;
 }
 
+function isPrivateFile(file) {
+  const filePath = `${file?.path || ''}/${file?.name || ''}`.replace(/\\/g, '/');
+  return /(^|\/)\.env[^/]*(?:\/|$)/i.test(filePath);
+}
+
 function buildFileTree(files) {
   const root = { name: 'root', type: 'folder', children: {} };
   files.forEach((f) => {
@@ -376,6 +518,63 @@ const SMART_PROMPTS = [
   { label: 'Fix the bug', hint: 'Diagnose and patch the current issue', icon: Bot },
 ];
 
+const AI_MODEL_PREFERENCE_KEY = 'buildrs-ai-model-preference';
+
+function getProviderModels(provider) {
+  const models = provider?.type === 'cloud' ? provider.models || [provider.model] : provider?.models || [];
+  return models.filter(Boolean);
+}
+
+function parseLegacyActionPayload(value) {
+  const text = String(value || '');
+  let attempts = 0;
+
+  for (let start = text.indexOf('{'); start !== -1 && attempts < 10; start = text.indexOf('{', start + 1)) {
+    attempts += 1;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let index = start; index < text.length; index += 1) {
+      const character = text[index];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (character === '\\') escaped = true;
+        else if (character === '"') inString = false;
+        continue;
+      }
+
+      if (character === '"') inString = true;
+      else if (character === '{') depth += 1;
+      else if (character === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          try {
+            const parsed = JSON.parse(text.slice(start, index + 1));
+            if (parsed && Array.isArray(parsed.actions)) return parsed;
+          } catch (_) {
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function sanitizePreviewOutput(value) {
+  return String(value || '')
+    .replace(/\u001b\[[0-9;]*G/g, '\n')
+    .replace(/\u001b\[[0-9;]*K/g, '')
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\r/g, '\n')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
+    .split('\n')
+    .filter((line) => !/^\s*[|/\\-]\s*$/.test(line))
+    .join('\n');
+}
+
 export default function Editor() {
   const router = useRouter();
   const user = useAuthStore((s) => s.user);
@@ -426,9 +625,15 @@ export default function Editor() {
   const [sidebarVisible, setSidebarVisible] = useState(true);
   const [activeSidebar, setActiveSidebar] = useState('explorer');
   const [panel, setPanel] = useState(null);
+  const [assistantDockOpen, setAssistantDockOpen] = useState(false);
   const [aiInput, setAiInput] = useState('');
   const [aiMessages, setAiMessages] = useState([]);
   const [aiLoading, setAiLoading] = useState(false);
+  const [aiModelProviders, setAiModelProviders] = useState([]);
+  const [selectedAiModel, setSelectedAiModel] = useState(null);
+  const [aiModelsLoading, setAiModelsLoading] = useState(false);
+  const [aiModelsLoaded, setAiModelsLoaded] = useState(false);
+  const [aiModelsError, setAiModelsError] = useState('');
   const [pendingConfirmations, setPendingConfirmations] = useState([]);
   const [agentExecution, setAgentExecution] = useState(null);
   const agentExecutionRef = useRef(null);
@@ -506,8 +711,6 @@ export default function Editor() {
   ]);
   const [selectedTaskId, setSelectedTaskId] = useState('task-1');
   const [specMode, setSpecMode] = useState(false);
-  const [byomOpen, setByomOpen] = useState(false);
-  const [customModel, setCustomModel] = useState('GPT-4.1');
   const [collaborators, setCollaborators] = useState([]);
   const [fileCollaborators, setFileCollaborators] = useState([]);
   const [fileAccess, setFileAccess] = useState(null);
@@ -535,7 +738,16 @@ export default function Editor() {
   const [prDone, setPrDone] = useState(null);
   const [deployments, setDeployments] = useState([]);
   const [sandboxUrl, setSandboxUrl] = useState(null);
+  const [previewState, setPreviewState] = useState('idle');
+  const [previewStage, setPreviewStage] = useState('');
+  const [previewError, setPreviewError] = useState('');
+  const [previewLogs, setPreviewLogs] = useState([]);
+  const previewAbortRef = useRef(null);
+  const previewTabRef = useRef(null);
   const [running, setRunning] = useState(false);
+  const [runStartedAt, setRunStartedAt] = useState(null);
+  const [runElapsedMs, setRunElapsedMs] = useState(0);
+  const [runOutcome, setRunOutcome] = useState('idle');
   const [termInfo, setTermInfo] = useState(null); // { type: 'pty'|'simulated', sessionId }
   const [showSubdomainInput, setShowSubdomainInput] = useState(false);
   const [deploySubdomain, setDeploySubdomain] = useState('');
@@ -550,6 +762,19 @@ export default function Editor() {
   const [confirmClose, setConfirmClose] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [confirmStop, setConfirmStop] = useState(null);
+  useEffect(() => () => {
+    if (previewAbortRef.current) previewAbortRef.current.abort();
+    else stopProjectPreview();
+    if (previewTabRef.current && !previewTabRef.current.closed) previewTabRef.current.close();
+  }, []);
+
+  useEffect(() => {
+    if (!running || !runStartedAt) return undefined;
+    const updateElapsed = () => setRunElapsedMs(Date.now() - runStartedAt);
+    updateElapsed();
+    const timer = setInterval(updateElapsed, 250);
+    return () => clearInterval(timer);
+  }, [running, runStartedAt]);
   // Switching workspace/project/repo destroys the live PTY (running builds
   // die with scrollback) — stage the switch behind a confirm while a
   // terminal session is active.
@@ -589,7 +814,11 @@ export default function Editor() {
   const workspaceId = selectedCompany?._id;
 
   const [projects, setProjects] = useState([]);
+  const [projectsLoading, setProjectsLoading] = useState(true);
+  const [projectsError, setProjectsError] = useState('');
   const [selectedProject, setSelectedProject] = useState(null);
+  const [projectPickerOpen, setProjectPickerOpen] = useState(false);
+  const [projectSearch, setProjectSearch] = useState('');
   const gitWorkspaceId = selectedProject?.workspaceId || workspaceId;
   const gitProjectId = selectedProject?._id || selectedProject?.id || null;
   const [githubRepos, setGithubRepos] = useState([]);
@@ -775,7 +1004,7 @@ export default function Editor() {
     // path in two repos never collides into one buffer/dirty state.
     const repoScope = selectedRepo
       ? (selectedRepo.fullName || `${selectedRepo.owner?.login || selectedRepo.owner || selectedRepo.ownerName || 'gh'}/${selectedRepo.name}`) +
-        (selectedBranch ? `@${selectedBranch}` : '')
+      (selectedBranch ? `@${selectedBranch}` : '')
       : 'none';
     if (file.path) return `github:${repoScope}:${file.path}`;
     if (file.name) return `github:${repoScope}:${file.name}`;
@@ -1418,7 +1647,7 @@ export default function Editor() {
           resizeObserver.observe(terminalRef.current);
         }
         if (typeof document !== 'undefined' && document.fonts && document.fonts.ready) {
-          document.fonts.ready.then(() => { if (!disposed) fitOnResize(); }).catch(() => {});
+          document.fonts.ready.then(() => { if (!disposed) fitOnResize(); }).catch(() => { });
         }
       })
       .catch(() => {
@@ -1516,10 +1745,17 @@ export default function Editor() {
   }
 
   async function loadProjects() {
+    setProjectsLoading(true);
+    setProjectsError('');
     try {
       const data = await projectApi.list();
-      setProjects(data.projects || []);
-    } catch {}
+      if (!Array.isArray(data.projects)) throw new Error('Could not load projects.');
+      setProjects(data.projects);
+    } catch (error) {
+      setProjectsError(error.message || 'Could not load projects. Please try again.');
+    } finally {
+      setProjectsLoading(false);
+    }
   }
 
   async function loadProjectFiles(projectId) {
@@ -1541,7 +1777,7 @@ export default function Editor() {
     try {
       const data = await apiFetch('/api/github/repos?per_page=20');
       setGithubRepos(data.repositories || []);
-    } catch {}
+    } catch { }
   }
 
   async function handleCreateGithubRepo(e) {
@@ -1626,7 +1862,7 @@ export default function Editor() {
     try {
       const data = await apiFetch('/api/figma/files').catch(() => null);
       if (data && data.files) setFigmaFiles(data.files);
-    } catch {}
+    } catch { }
   }
 
   async function generateFromDesign() {
@@ -1700,7 +1936,7 @@ export default function Editor() {
       const data = await apiFetch('/api/code-editor/languages');
       setLanguages(data.languages || []);
       setTier(data.tier || '');
-    } catch {}
+    } catch { }
   }
 
   async function loadGitStatus() {
@@ -1712,7 +1948,7 @@ export default function Editor() {
       // empty state instead of a fake clean tree.
       if (data && data.success !== false) setGitStatus(data);
       else setGitStatus(null);
-    } catch {}
+    } catch { }
   }
 
   // Branch + recent commits + local changes for the selected GitHub repo.
@@ -1726,7 +1962,7 @@ export default function Editor() {
     try {
       const data = await apiFetch(`/api/github/repos/${owner}/${repo.name}/commits?per_page=10`);
       commits = data?.commits || [];
-    } catch {}
+    } catch { }
     setGitStatus({
       success: true,
       branch: branch || repo.default_branch || repo.defaultBranch || 'main',
@@ -1765,7 +2001,7 @@ export default function Editor() {
     try {
       const data = await apiFetch('/api/deployments', options).catch(() => null);
       if (data && data.deployments) setDeployments(data.deployments);
-    } catch {}
+    } catch { }
   }
 
   // Deployment status arrives over the socket instead of waiting for the next
@@ -1967,26 +2203,89 @@ export default function Editor() {
     }
   }, [taskCards]);
 
-  async function handleAiHelperSend(e) {
-    e.preventDefault();
-    if (!aiInput.trim()) return;
-    const userMsg = { role: 'user', content: aiInput };
+  async function loadAiModels(forceRefresh = false) {
+    setAiModelsLoading(true);
+    setAiModelsError('');
+    try {
+      const data = await apiFetch('/api/ai-pair/providers', forceRefresh ? { forceRefresh: true } : undefined);
+      if (!data.success || !Array.isArray(data.providers)) {
+        throw new Error(data.message || 'Could not load available AI models.');
+      }
+
+      const providers = data.providers;
+      setAiModelProviders(providers);
+      let savedPreference = null;
+      try {
+        savedPreference = JSON.parse(localStorage.getItem(AI_MODEL_PREFERENCE_KEY) || 'null');
+      } catch (error) {
+        console.warn('Could not read the saved AI model preference:', error);
+        localStorage.removeItem(AI_MODEL_PREFERENCE_KEY);
+      }
+
+      const savedProvider = providers.find((provider) => provider.key === savedPreference?.provider);
+      const savedModel = getProviderModels(savedProvider).includes(savedPreference?.model)
+        ? savedPreference.model
+        : null;
+      const defaultProvider = providers.find((provider) => provider.key === data.defaultProvider);
+      const defaultModel = getProviderModels(defaultProvider)[0];
+      const provider = savedModel ? savedProvider : defaultProvider;
+      const model = savedModel || defaultModel;
+      setSelectedAiModel(provider && model
+        ? { provider: provider.key, providerName: provider.name, type: provider.type, model }
+        : null);
+      setAiModelsLoaded(true);
+      if (!providers.some((entry) => getProviderModels(entry).length)) {
+        setAiModelsError('No AI models are currently available. Configure a provider or connect a local model.');
+      }
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      console.error('Failed to load available AI models:', failure);
+      setAiModelsError(failure.message || 'Could not load available AI models.');
+      setAiModelsLoaded(false);
+    } finally {
+      setAiModelsLoading(false);
+    }
+  }
+
+  function handleAiModelChange(event) {
+    const option = aiModelOptions.find((entry) => entry.value === event.target.value);
+    if (!option) return;
+    const model = {
+      provider: option.provider,
+      providerName: option.providerName,
+      type: option.type,
+      model: option.model,
+    };
+    setSelectedAiModel(model);
+    setAiModelsError('');
+    try {
+      localStorage.setItem(AI_MODEL_PREFERENCE_KEY, JSON.stringify({
+        provider: model.provider,
+        model: model.model,
+      }));
+    } catch (error) {
+      console.error('Could not save the selected AI model:', error);
+      setAiModelsError('Model selected, but the preference could not be saved in this browser.');
+    }
+  }
+
+  async function handleAiHelperSend(e, prompt = aiInput) {
+    e?.preventDefault();
+    const input = String(prompt || '').trim();
+    if (!input) return;
+    const userMsg = { role: 'user', content: input };
     setAiMessages((prev) => [...prev, userMsg]);
-    const input = aiInput;
     setAiInput('');
     setAiLoading(true);
     try {
       const session = await ensureAiSession();
       // Only pass companyId if there's an actual team workspace
       const companyId = selectedCompany?._id || null;
-      const shouldUseAgentLoop = /fix|refactor|review|debug|ship|patch|build|deploy/i.test(input);
       // Never ship secrets to the model: .env* files are stripped from AI
       // context (paste values explicitly if the question needs them).
-      const ENV_FILE_RE = /(^|\/)\.env(\.|$)/i;
       const skippedEnv = [];
-      const envName = (f) => `${f?.path || ''}/${f?.name || ''}`;
       const safeFiles = files.slice(0, 25).filter((file) => {
-        if (ENV_FILE_RE.test(envName(file))) {
+        if (isPrivateFile(file)) {
           skippedEnv.push(file.name || file.path);
           return false;
         }
@@ -1994,26 +2293,34 @@ export default function Editor() {
       });
       let safeCurrent = undefined;
       if (selectedFile) {
-        if (ENV_FILE_RE.test(envName(selectedFile))) {
+        if (isPrivateFile(selectedFile)) {
           skippedEnv.push(selectedFile.name);
         } else {
-          safeCurrent = { name: selectedFile.name, path: selectedFile.path, content: content.slice(0, 2000) };
+          safeCurrent = {
+            name: selectedFile.name,
+            path: selectedFile.path,
+            language: selectedFile.language || detectLanguage(selectedFile.name),
+            content: content.slice(0, 20000),
+          };
         }
       }
       const data = await apiFetch('/api/ai-pair/chat', {
         method: 'POST',
-        timeoutMs: shouldUseAgentLoop ? 1800000 : 120000,
+        timeoutMs: 120000,
         body: JSON.stringify({
           sessionId: session._id,
           message: input,
           companyId,
-          enableActions: shouldUseAgentLoop,
-          useAgentLoop: shouldUseAgentLoop,
-            codeContext: {
-              workspace: {
-                id: selectedProject?.workspaceId || workspaceId || selectedCompany?._id,
-                name: selectedProject?.name || selectedRepo?.name || 'workspace',
-              },
+          provider: selectedAiModel?.provider,
+          model: selectedAiModel?.model,
+          enableActions: false,
+          useAgentLoop: false,
+          codeContext: {
+            responseStyle: 'organized',
+            workspace: {
+              id: selectedProject?.workspaceId || workspaceId || selectedCompany?._id,
+              name: selectedProject?.name || selectedRepo?.name || 'workspace',
+            },
             files: safeFiles.map((file) => ({ id: file._id || file.id, name: file.name, path: file.path, language: file.language })),
             currentFile: safeCurrent,
             repository: selectedRepo ? {
@@ -2025,16 +2332,16 @@ export default function Editor() {
           },
         }),
       });
-      let reply = data.message?.content || data.message || data.result?.summary?.message || 'No response';
+      const responseText = typeof data.message?.content === 'string'
+        ? data.message.content
+        : typeof data.message === 'string'
+          ? data.message
+          : data.result?.summary?.message || 'No response';
+      let reply = responseText;
       if (skippedEnv.length) {
         reply += `\n\n_Skipped ${skippedEnv.length} .env file(s) for privacy — paste values explicitly if needed._`;
       }
       setAiMessages((prev) => [...prev, { role: 'assistant', content: reply }]);
-      if (shouldUseAgentLoop && data.result) {
-        hydrateAgentExecutionFromResult(input.trim(), data.result, data.executionId);
-      } else if (shouldUseAgentLoop) {
-        startAgentExecution(input.trim());
-      }
     } catch (err) {
       setAiMessages((prev) => [...prev, { role: 'assistant', content: `Error: ${err.message}` }]);
     } finally {
@@ -2117,7 +2424,7 @@ export default function Editor() {
       });
     }
     if (sourceFile?._id) {
-      apiFetch(`/api/collaboration/file/${sourceFile._id}/join`, { method: 'POST' }).catch(() => {});
+      apiFetch(`/api/collaboration/file/${sourceFile._id}/join`, { method: 'POST' }).catch(() => { });
     }
   }, [fetchGithubFileContent, getFileKey, selectedRepo]);
 
@@ -2307,6 +2614,7 @@ export default function Editor() {
   }
 
   function applyRunResult(result, file) {
+    setRunOutcome(result?.success ? 'passed' : 'failed');
     const problems = Array.isArray(result?.problems) ? result.problems : [];
     setExternalProblems(problems);
     const model = editorRef.current?.getModel?.() || null;
@@ -2326,10 +2634,15 @@ export default function Editor() {
   }
 
   function stopRun() {
-    if (runAbortRef.current) {
-      runAbortRef.current.abort();
-      appendOutput('sys', '▸ Run stopped');
-    }
+    if (!running) return;
+    runSeqRef.current += 1;
+    runAbortRef.current?.abort();
+    runAbortRef.current = null;
+    setRunOutcome('stopped');
+    setRunElapsedMs(runStartedAt ? Date.now() - runStartedAt : runElapsedMs);
+    setRunStartedAt(null);
+    setRunning(false);
+    appendOutput('sys', '▸ Run stopped');
   }
 
   // Collect the runnable/previewable file set: open buffers first (they win
@@ -2337,7 +2650,8 @@ export default function Editor() {
   function collectActiveFiles(activeContentOverride) {
     const safePath = (p) => {
       const rel = String(p || '').replace(/^\/+/, '');
-      return /^[\w.\-]+(\/[\w.\-]+)*$/.test(rel) ? rel : null;
+      if (!/^[\w.\-]+(\/[\w.\-]+)*$/.test(rel)) return null;
+      return rel.split('/').some((segment) => segment === '.' || segment === '..') ? null : rel;
     };
     const out = [];
     const seen = new Set();
@@ -2370,11 +2684,9 @@ export default function Editor() {
     }
     const lang = runLanguageFor(file);
     // Web pages (and anything the runner can't classify) don't run through
-    // the code runner — preview them in the sandbox instead of erroring out.
+    // the code runner — preview the project instead of erroring out.
     if (lang.language === 'auto' || /\.(html?|xhtml|css)$/i.test(file.name || '')) {
-      await handleSandboxStart(file);
-      setPanel(null);
-      showSidebar('debug');
+      await handleProjectPreview(file);
       return;
     }
     const editor = editorRef.current;
@@ -2393,7 +2705,11 @@ export default function Editor() {
 
     runAbortRef.current?.abort();
     const myRun = ++runSeqRef.current;
+    const startedAt = Date.now();
     setRunning(true);
+    setRunStartedAt(startedAt);
+    setRunElapsedMs(0);
+    setRunOutcome('running');
     setExternalProblems([]);
     setRunProblems(monacoRef.current, editor?.getModel?.() || null, []);
     clearOutput();
@@ -2415,16 +2731,21 @@ export default function Editor() {
           applyRunResult(data, file);
         }
       });
-      runAbortRef.current = stream;
+      if (runSeqRef.current === myRun) runAbortRef.current = stream;
+      else stream.abort();
       await stream.done;
     } catch (err) {
       if (err?.name !== 'AbortError' && runSeqRef.current === myRun) {
+        setRunOutcome('failed');
         appendOutput('err', `Run failed: ${err.message || err}`);
       }
     } finally {
       if (runSeqRef.current === myRun) {
         flushRunLine();
         runAbortRef.current = null;
+        setRunElapsedMs(Date.now() - startedAt);
+        setRunStartedAt(null);
+        setRunOutcome((outcome) => outcome === 'running' ? 'completed' : outcome);
         setRunning(false);
       }
     }
@@ -2551,7 +2872,7 @@ export default function Editor() {
           if (!model || model.getLanguageId() !== 'python') return;
           const uri = activeUri();
           if (!uri) return;
-          lspApi.change({ documentUri: uri, content: model.getValue(), language: 'python' }).catch(() => {});
+          lspApi.change({ documentUri: uri, content: model.getValue(), language: 'python' }).catch(() => { });
         } catch (_) {
           // Editor remounted/disposed mid-debounce — stale timer, ignore.
         }
@@ -2688,9 +3009,9 @@ export default function Editor() {
   }
 
   async function createFileAt(rawName, parentPath) {
-    const segments = String(rawName || '').trim().split('/').filter(Boolean);
+    const segments = String(rawName || '').replace(/\\/g, '/').trim().split('/').filter(Boolean);
     const name = segments.pop();
-    if (!name || name === '.' || name === '..') return;
+    if (!name || segments.concat(name).some((segment) => segment === '.' || segment === '..')) return;
     const dir = [parentPath, ...segments].filter(Boolean).join('/');
     const filePath = dir ? `/${dir}` : '/';
     const language = detectLanguage(name);
@@ -3020,9 +3341,11 @@ export default function Editor() {
             return file.content !== remote; // skip unchanged files
           });
           if (!filesToPush.length) {
-            setStatus({ type: 'error', msg: stagedPaths.size
-              ? 'The staged files have no content changes to push.'
-              : 'Stage at least one changed file before committing.' });
+            setStatus({
+              type: 'error', msg: stagedPaths.size
+                ? 'The staged files have no content changes to push.'
+                : 'Stage at least one changed file before committing.'
+            });
             return;
           }
 
@@ -3070,7 +3393,7 @@ export default function Editor() {
             [...repoStaged].filter((filePath) => !pushedPaths.has(filePath))
           );
           setRepoStaged(remainingStaged);
-          await loadRepoGitStatus(selectedRepo, selectedBranch, remainingStaged).catch(() => {});
+          await loadRepoGitStatus(selectedRepo, selectedBranch, remainingStaged).catch(() => { });
 
           setStatus({
             type: 'success',
@@ -3148,7 +3471,7 @@ export default function Editor() {
         : prev));
       setStatus({ type: 'success', msg: `Git ${action} done` });
       if (action === 'push' || action === 'pull') {
-        await loadGitStatus().catch(() => {});
+        await loadGitStatus().catch(() => { });
       }
     } catch (e) {
       setStatus({ type: 'error', msg: `Git ${action} failed: ${e.message}` });
@@ -3345,59 +3668,162 @@ export default function Editor() {
     }));
   }
 
-  async function handleSandboxStart(fileOverride) {
-    // Also used as a click handler — ignore the event object it receives.
+  function closePendingPreviewTab(tab = previewTabRef.current) {
+    if (tab && !tab.closed) tab.close();
+    if (previewTabRef.current === tab) previewTabRef.current = null;
+  }
+
+  function openPreviewInNewTab(url) {
+    if (!url) return false;
+    const tab = window.open('about:blank', '_blank');
+    if (!tab) {
+      setStatus({ type: 'error', msg: 'Your browser blocked the preview tab. Allow pop-ups and try again.' });
+      return false;
+    }
+    tab.opener = null;
+    tab.location.replace(url);
+    return true;
+  }
+
+  async function handleProjectPreview(fileOverride, { openInNewTab = true } = {}) {
+    let readyUrl = '';
     const previewTarget = (fileOverride && typeof fileOverride === 'object' && fileOverride.name)
       ? fileOverride
-      : (selectedFile || files[0] || null);
+      : (selectedFileRef.current || selectedFile || files[0] || null);
     if (!previewTarget) {
-      setStatus({ type: 'error', msg: 'Select a file to preview first.' });
+      setPreviewError('Open a project file before starting a preview.');
+      setPreviewState('error');
+      setPanel('preview');
       return;
     }
 
-    try {
-      setStatus({ type: 'success', msg: 'Starting sandbox...' });
-      const { files: collected, safePath } = collectActiveFiles(undefined);
-      const entryRel = safePath(fileFullPath(previewTarget));
-      const entryContent = openContentsRef.current[getFileKey(previewTarget)]
-        ?? previewTarget.content
-        ?? content
-        ?? '';
-      if (entryRel && !collected.some((f) => f.path === entryRel)) {
-        collected.unshift({ path: entryRel, content: typeof entryContent === 'string' ? entryContent : '' });
-      }
-      const rawId = String(previewTarget._id || previewTarget.id || '');
-      const payload = {
-        // Only send a real Mongo id — GitHub/pending pseudo-ids would make
-        // CodeFile.findById throw a cast error server-side.
-        fileId: /^[0-9a-f]{24}$/i.test(rawId) ? rawId : null,
-        name: previewTarget.name,
-        path: previewTarget.path || '/',
-        language: previewTarget.language || 'javascript',
-        content: typeof entryContent === 'string' ? entryContent : '',
-        files: collected.slice(0, 200),
-        source: selectedRepo ? 'github' : selectedProject ? 'project' : 'local',
-      };
-
-      const data = await apiFetch('/api/sandbox/start', {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      });
-      // Prefer the path form: behind Render's proxy the server's own
-      // protocol/host can be wrong (http → mixed-content iframe).
-      const url = data.sandboxPath
-        ? `${API_BASE_URL}${data.sandboxPath}`
-        : data.sandboxUrl;
-      if (url) {
-        setSandboxUrl(url);
-        setStatus({ type: 'success', msg: 'Sandbox ready!' });
-        setTimeout(() => setStatus(null), 2000);
-      } else {
-        setStatus({ type: 'error', msg: 'Sandbox did not start' });
-      }
-    } catch (err) {
-      setStatus({ type: 'error', msg: `Sandbox error: ${err.message}` });
+    if (previewAbortRef.current) previewAbortRef.current.abort();
+    else stopProjectPreview();
+    closePendingPreviewTab();
+    const previewTab = openInNewTab ? window.open('about:blank', '_blank') : null;
+    if (previewTab) {
+      previewTab.opener = null;
+      previewTab.document.title = 'Starting project preview';
+      previewTab.document.body.textContent = 'Preparing your project preview…';
     }
+    previewTabRef.current = previewTab;
+    const controller = new AbortController();
+    previewAbortRef.current = controller;
+    setPanel('preview');
+    setSandboxUrl(null);
+    setPreviewError('');
+    setPreviewLogs([]);
+    setPreviewState('starting');
+    setPreviewStage('Preparing your project preview…');
+
+    try {
+      const activeContent = editorRef.current?.getValue?.();
+      const { files: collected, safePath } = collectActiveFiles(activeContent);
+      const targetPath = safePath(fileFullPath(previewTarget));
+      const targetContent = collected.find((file) => file.path === targetPath)?.content
+        ?? openContentsRef.current[getFileKey(previewTarget)]
+        ?? previewTarget.content
+        ?? '';
+      if (targetPath && !collected.some((file) => file.path === targetPath)) {
+        collected.unshift({ path: targetPath, content: String(targetContent) });
+      }
+      const previewFiles = collected.filter((file) => !isPrivateFile({ path: file.path }));
+
+      const manifest = previewFiles.find((file) => file.path === 'package.json');
+      let packageJson = null;
+      if (manifest) {
+        try {
+          packageJson = JSON.parse(manifest.content);
+        } catch (error) {
+          throw new Error(`Could not read package.json: ${error.message}`);
+        }
+      }
+
+      if (['dev', 'start'].some((script) => typeof packageJson?.scripts?.[script] === 'string')) {
+        const url = await startProjectPreview(previewFiles, {
+          signal: controller.signal,
+          onOutput: (chunk) => {
+            const cleaned = sanitizePreviewOutput(chunk);
+            if (cleaned) setPreviewLogs((previous) => [...previous, cleaned.slice(0, 2000)].slice(-30));
+          },
+          onStatus: (stage) => {
+            setPreviewStage(stage);
+            if (previewTab && !previewTab.closed) previewTab.document.body.textContent = stage;
+          },
+        });
+        if (controller.signal.aborted) return;
+        readyUrl = url;
+        setSandboxUrl(url);
+      } else {
+        const htmlFiles = previewFiles.filter((file) => /\.(html?|xhtml)$/i.test(file.path));
+        const entry = htmlFiles.find((file) => file.path.toLowerCase() === 'index.html')
+          || htmlFiles.find((file) => /(^|\/)index\.html$/i.test(file.path))
+          || htmlFiles.find((file) => file.path === targetPath)
+          || htmlFiles[0];
+        if (!entry) {
+          throw new Error('No HTML entry file was found. Add an index.html, or add a "dev" or "start" script to package.json.');
+        }
+
+        setPreviewStage('Starting secure HTML preview…');
+        if (previewTab && !previewTab.closed) previewTab.document.body.textContent = 'Starting secure HTML preview…';
+        const pathParts = entry.path.split('/');
+        const name = pathParts.pop();
+        const payload = {
+          fileId: null,
+          name,
+          path: pathParts.length ? `/${pathParts.join('/')}` : '/',
+          language: 'html',
+          content: entry.content,
+          files: previewFiles.slice(0, 200),
+          source: selectedRepo ? 'github' : selectedProject ? 'project' : 'local',
+        };
+        const data = await apiFetch('/api/sandbox/start', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        });
+        if (controller.signal.aborted) return;
+        const url = data.sandboxPath
+          ? `${API_BASE_URL}${data.sandboxPath}`
+          : data.sandboxUrl;
+        if (!url) throw new Error('The preview server did not return a URL.');
+        readyUrl = url;
+        setSandboxUrl(url);
+      }
+
+      if (previewTab && !previewTab.closed) {
+        previewTab.location.replace(readyUrl);
+        if (previewTabRef.current === previewTab) previewTabRef.current = null;
+      }
+      setPreviewState('running');
+      setPreviewStage('Preview ready.');
+      setStatus({ type: 'success', msg: 'Project preview is ready.' });
+      setTimeout(() => setStatus(null), 2000);
+    } catch (error) {
+      if (error?.name === 'AbortError') {
+        closePendingPreviewTab(previewTab);
+        if (previewAbortRef.current === controller) setPreviewState('stopped');
+        return;
+      }
+      if (previewAbortRef.current !== controller) return;
+      closePendingPreviewTab(previewTab);
+      const message = error?.data?.error || error?.data?.message || error?.message || 'Could not start project preview.';
+      setPreviewError(message);
+      setPreviewState('error');
+      setPreviewStage('');
+      setStatus({ type: 'error', msg: `Preview error: ${message}` });
+    } finally {
+      if (previewAbortRef.current === controller) previewAbortRef.current = null;
+    }
+  }
+
+  function handlePreviewStop() {
+    if (previewAbortRef.current) previewAbortRef.current.abort();
+    else stopProjectPreview();
+    closePendingPreviewTab();
+    previewAbortRef.current = null;
+    setSandboxUrl(null);
+    setPreviewState('stopped');
+    setPreviewStage('');
   }
 
   function handleDelete(file) {
@@ -3463,7 +3889,7 @@ export default function Editor() {
       { kind: 'command', label: 'Git: Refresh Status', icon: GitBranch, run: () => handleGitAction('status') },
       { kind: 'command', label: 'Git: View changes and diff', icon: GitPullRequestArrow, run: () => showSidebar('scm') },
       { kind: 'command', label: 'Deploy: Deploy Project', icon: Rocket, run: handleDeploy },
-      { kind: 'command', label: 'Sandbox: Start preview', icon: Box, run: handleSandboxStart },
+      { kind: 'command', label: 'Preview: Start project', icon: Eye, run: handleProjectPreview },
       { kind: 'command', label: 'Terminal: Toggle', icon: Terminal, run: () => setPanel((p) => (p === 'terminal' ? null : 'terminal')) },
       { kind: 'command', label: 'View: Explorer', icon: FolderOpen, run: () => showSidebar('explorer') },
       { kind: 'command', label: 'View: Search files', icon: Search, run: () => showSidebar('search') },
@@ -3575,7 +4001,147 @@ export default function Editor() {
     [externalProblems, problemList]
   );
   const allProblems = [...externalProblems, ...problemList];
+  const aiModelOptions = aiModelProviders.flatMap((provider) => getProviderModels(provider).map((model) => ({
+    provider: provider.key,
+    providerName: provider.name,
+    type: provider.type,
+    model,
+    value: JSON.stringify({ provider: provider.key, model }),
+  })));
+  function renderAiModelSelector(className, label) {
+    if (!aiModelOptions.length) {
+      return (
+        <button
+          type="button"
+          className={`${className} ed-assistant-model-retry`}
+          onClick={() => loadAiModels(true)}
+          disabled={aiModelsLoading}
+        >
+          {aiModelsLoading ? 'Loading models…' : aiModelsError ? 'Retry models' : 'Load models'}
+        </button>
+      );
+    }
+
+    return (
+      <select
+        className={`${className} ed-assistant-model-select`}
+        value={selectedAiModel ? JSON.stringify({
+          provider: selectedAiModel.provider,
+          model: selectedAiModel.model,
+        }) : ''}
+        onChange={handleAiModelChange}
+        aria-label={label}
+        disabled={aiModelsLoading || aiLoading}
+      >
+        {!selectedAiModel && <option value="" disabled>Choose a model</option>}
+        {aiModelProviders.map((provider) => {
+          const models = getProviderModels(provider);
+          return models.length ? (
+            <optgroup key={provider.key} label={provider.name}>
+              {models.map((model) => (
+                <option
+                  key={`${provider.key}:${model}`}
+                  value={JSON.stringify({ provider: provider.key, model })}
+                >
+                  {model}
+                </option>
+              ))}
+            </optgroup>
+          ) : null;
+        })}
+      </select>
+    );
+  }
+
+  function renderStructuredAssistantMessage(message, messageIndex) {
+    const answer = parseAssistantAnswer(message.content);
+    const summaryParagraphs = answer.summary.split(/\n{2,}/).filter(Boolean);
+
+    return (
+      <article key={`${message.role}-${messageIndex}`} className="ed-assistant-answer">
+        <div className="ed-assistant-reading-agent">AI Agent</div>
+        {summaryParagraphs.map((paragraph, paragraphIndex) => (
+          <p key={`summary-${paragraphIndex}`} className="ed-assistant-answer-summary">{paragraph}</p>
+        ))}
+        {answer.test && (
+          <div className="ed-assistant-answer-test">
+            {answer.test.file && <span>{answer.test.file}</span>}
+            {answer.test.detail && <p>{answer.test.detail}</p>}
+          </div>
+        )}
+        {answer.sections.map((section, sectionIndex) => (
+          <section key={`${section.title}-${sectionIndex}`} className="ed-assistant-answer-section">
+            <h3>{section.title}</h3>
+            {section.content && section.content.split(/\n{2,}/).filter(Boolean).map((paragraph, paragraphIndex) => (
+              <p key={`paragraph-${paragraphIndex}`}>{paragraph}</p>
+            ))}
+            {section.items?.length > 0 && (
+              <ul>
+                {section.items.map((item, itemIndex) => <li key={`item-${itemIndex}`}>{item}</li>)}
+              </ul>
+            )}
+            {section.codeBlocks?.map((block, blockIndex) => (
+              <pre key={`code-${blockIndex}`} className="ed-assistant-code-block">
+                {block.language && <code className="ed-assistant-code-language">{block.language}</code>}
+                <code>{block.content}</code>
+              </pre>
+            ))}
+          </section>
+        ))}
+      </article>
+    );
+  }
+
+  const latestAiQuestion = [...aiMessages].reverse().find((message) => message.role === 'user')?.content || '';
+  const aiCurrentFileIsPrivate = isPrivateFile(selectedFile);
+  const aiReadMethod = useMemo(() => {
+    if (!content || aiCurrentFileIsPrivate) return '';
+    const queryTerms = new Set(latestAiQuestion.toLowerCase().split(/[^a-z0-9_$]+/).filter((term) => term.length > 2));
+    const excluded = new Set(['if', 'for', 'while', 'switch', 'catch', 'constructor', 'function']);
+    const methods = Array.from(content.matchAll(/(?:async\s+)?([A-Za-z_$][\w$]*)\s*\([^)\n]*\)\s*(?::\s*[^{}\n]+)?\s*\{/g))
+      .map((match) => match[1])
+      .filter((name) => !excluded.has(name));
+    return methods
+      .map((name, index) => {
+        const parts = name.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().split(/\s+/);
+        const score = parts.reduce((total, part) => total + (queryTerms.has(part) ? 1 : 0), 0);
+        return { name, index, score };
+      })
+      .sort((a, b) => b.score - a.score || a.index - b.index)[0]?.name || '';
+  }, [content, latestAiQuestion, aiCurrentFileIsPrivate]);
   const filePathSegs = selectedFile ? String(selectedFile.path || selectedFile.name || '').split('/').filter(Boolean) : [];
+  const showWelcomeExplorer = !selectedFile && !selectedProject && !selectedRepo && files.length === 0 && !inlineCreate;
+  const filteredProjects = useMemo(() => {
+    const query = projectSearch.trim().toLowerCase();
+    if (!query) return projects;
+    return projects.filter((project) => {
+      const technologies = Array.isArray(project.technologies)
+        ? project.technologies
+        : (Array.isArray(project.tags) ? project.tags : []);
+      const searchable = [
+        project.name,
+        project.description,
+        project.githubRepoName,
+        project.defaultBranch,
+        ...technologies,
+      ].filter(Boolean).join(' ').toLowerCase();
+      return searchable.includes(query);
+    });
+  }, [projects, projectSearch]);
+  const openProjectPicker = () => {
+    setProjectSearch('');
+    setProjectPickerOpen(true);
+  };
+  const selectProjectForEditor = (project) => {
+    requestScopeSwitch(() => {
+      pendingRestoreRef.current = null;
+      setSelectedRepo(null);
+      setSelectedProject(project);
+      setSelectedFile(null);
+      setContent('');
+      setProjectPickerOpen(false);
+    });
+  };
   const searchMatches = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
     if (!query) return [];
@@ -3627,7 +4193,7 @@ export default function Editor() {
         <link rel="icon" href="/buildrs.png" />
       </Head>
 
-<div className="workspace-container ed-workspace-shell">
+      <div className="workspace-container ed-workspace-shell">
         <Sidebar
           user={user}
           subscription={subscription}
@@ -3645,1670 +4211,1943 @@ export default function Editor() {
         <main className="workspace-main ed-workspace-main">
           <div className="ed-page">
             {/* ---- Editor workspace ---- */}
-            <div className="ed-body">
-          {/* Activity bar */}
-          <nav className="ed-actbar">
-            <button type="button" className={`ed-actbtn ${activeSidebar === 'explorer' ? 'is-active' : ''}`} onClick={() => showSidebar('explorer')} title="Explorer (⌘B)">
-              <FolderOpen className="w-5 h-5" />
-            </button>
-            <button type="button" className={`ed-actbtn ${activeSidebar === 'search' ? 'is-active' : ''}`} onClick={() => showSidebar('search')} title="Search">
-              <Search className="w-5 h-5" />
-            </button>
-            <button type="button" className={`ed-actbtn ${activeSidebar === 'scm' ? 'is-active' : ''}`} onClick={() => showSidebar('scm')} title="Source Control">
-              <GitBranch className="w-5 h-5" />
-              {modifiedCount > 0 && <span className="ed-actbadge">{modifiedCount}</span>}
-            </button>
-            <button type="button" className={`ed-actbtn ${activeSidebar === 'debug' ? 'is-active' : ''}`} onClick={() => showSidebar('debug')} title="Debug">
-              <Bug className="w-5 h-5" />
-            </button>
-            <div className="ed-actbar-grow" />
-            <button type="button" className="ed-actbtn" onClick={() => setAboutOpen(true)} title="Help & shortcuts">
-              <HelpCircle className="w-5 h-5" />
-            </button>
-          </nav>
+            <div className={`ed-body ${showWelcomeExplorer && sidebarVisible && activeSidebar === 'explorer' ? 'is-welcome-empty' : ''}`}>
+              {/* Activity bar */}
+              <nav className="ed-actbar">
+                <button type="button" className={`ed-actbtn ${activeSidebar === 'explorer' ? 'is-active' : ''}`} onClick={() => showSidebar('explorer')} title="Explorer (⌘B)">
+                  <FolderOpen className="w-5 h-5" />
+                </button>
+                <button type="button" className={`ed-actbtn ${activeSidebar === 'search' ? 'is-active' : ''}`} onClick={() => showSidebar('search')} title="Search">
+                  <Search className="w-5 h-5" />
+                </button>
+                <button type="button" className={`ed-actbtn ${activeSidebar === 'scm' ? 'is-active' : ''}`} onClick={() => showSidebar('scm')} title="Source Control">
+                  <GitBranch className="w-5 h-5" />
+                  {modifiedCount > 0 && <span className="ed-actbadge">{modifiedCount}</span>}
+                </button>
+                <button type="button" className={`ed-actbtn ${activeSidebar === 'debug' ? 'is-active' : ''}`} onClick={() => showSidebar('debug')} title="Debug">
+                  <Bug className="w-5 h-5" />
+                </button>
+                <div className="ed-actbar-grow" />
+                <button type="button" className="ed-actbtn" onClick={() => setAboutOpen(true)} title="Help & shortcuts">
+                  <HelpCircle className="w-5 h-5" />
+                </button>
+              </nav>
 
-          {/* ---- Contextual sidebar ---- */}
-          {sidebarVisible && (
-            <aside className="ed-sidebar">
-              {activeSidebar === 'explorer' && (
-                <>
-                  <div className="ed-sidebar-head">
-                    <span className="ed-sidebar-title">Explorer</span>
-                    <div className="ed-sidebar-actions">
-                      <button type="button" className="ed-sidebar-btn" onClick={() => startInlineCreate()} title="New File"><FilePlus className="w-3.5 h-3.5" /></button>
-                      <button type="button" className="ed-sidebar-btn" onClick={() => startInlineCreate('folder')} title="New Folder"><FolderPlus className="w-3.5 h-3.5" /></button>
-                      <button type="button" className="ed-sidebar-btn" onClick={reloadFiles} title="Refresh"><RefreshCw className="w-3.5 h-3.5" /></button>
-                    </div>
-                  </div>
-                  <div className="ed-sidebar-body" style={{ padding: '0.6rem 0.75rem 0.4rem' }}>
-                    <div className="ed-project-wrap" ref={dropdownRef}>
-                      <button type="button" className="ed-project-btn" onClick={() => setShowProjectSelector(!showProjectSelector)}>
-                        <FolderOpen className="w-3.5 h-3.5" />
-                        <span className="ed-project-label">{selectedProject ? selectedProject.name : selectedRepo ? (selectedRepo.fullName || selectedRepo.name) : 'Workspace'}</span>
-                        <ChevronDown className={`w-3 h-3 transition-transform ${showProjectSelector ? 'rotate-180' : ''}`} style={{ color: '#748194' }} />
-                      </button>
-                      {showProjectSelector && (
-                        <div className="ed-drop">
-                          <button type="button" className="ed-drop-item" onClick={() => requestScopeSwitch(() => { setSelectedProject(null); setSelectedRepo(null); setShowProjectSelector(false); })}>
-                            <FolderOpen className="w-3.5 h-3.5" /> Workspace Files
-                          </button>
-                          {(workspaceId || selectedProject) && (
-                            <button type="button" className="ed-drop-item" onClick={() => { setShowProjectSelector(false); setRepoCreateOpen(true); }}>
-                              <GitBranch className="w-3.5 h-3.5" /> Create GitHub Repo
+              {/* ---- Contextual sidebar ---- */}
+              {sidebarVisible && (
+                <aside className="ed-sidebar">
+                  {activeSidebar === 'explorer' && (
+                    <>
+                      <div className="ed-sidebar-head">
+                        <span className="ed-sidebar-title">Explorer</span>
+                        <div className="ed-sidebar-actions">
+                          {showWelcomeExplorer ? (
+                            <button type="button" className="ed-sidebar-btn" onClick={() => showSidebar('search')} title="Search">
+                              <Search className="w-4 h-4" />
                             </button>
+                          ) : (
+                            <>
+                              <button type="button" className="ed-sidebar-btn" onClick={() => startInlineCreate()} title="New File"><FilePlus className="w-3.5 h-3.5" /></button>
+                              <button type="button" className="ed-sidebar-btn" onClick={() => startInlineCreate('folder')} title="New Folder"><FolderPlus className="w-3.5 h-3.5" /></button>
+                              <button type="button" className="ed-sidebar-btn" onClick={reloadFiles} title="Refresh"><RefreshCw className="w-3.5 h-3.5" /></button>
+                            </>
                           )}
-                          {projects.length > 0 && <div className="ed-drop-section">Projects</div>}
-                          {projects.map((p) => (
-                            <button key={p._id || p.id} type="button" className="ed-drop-item" onClick={() => requestScopeSwitch(() => { setSelectedProject(p); setSelectedRepo(null); setShowProjectSelector(false); })}>
-                              <Folder className="w-3.5 h-3.5" /> {p.name}
-                            </button>
-                          ))}
-                          {githubRepos.length > 0 && <div className="ed-drop-section">GitHub Repos</div>}
-                          {githubRepos.map((r) => (
-                            <button key={r.id || r.fullName} type="button" className="ed-drop-item" onClick={() => requestScopeSwitch(() => { setSelectedRepo(r); setSelectedProject(null); setShowProjectSelector(false); })}>
-                              <GitBranch className="w-3.5 h-3.5" /> {r.fullName || r.name}
-                            </button>
-                          ))}
                         </div>
-                      )}
-                    </div>
-                    <div className="ed-filter-wrap">
-                      <input type="text" className="ed-filter" placeholder="Filter files..."
-                        value={fileFilter} onChange={(e) => setFileFilter(e.target.value)} />
-                    </div>
-                    <div className="ed-tree">
-                      {loading ? (
-                        <div className="ed-empty">
-                          <Loader2 className="w-5 h-5 animate-spin" />
-                          <span className="text-xs">Loading files...</span>
-                        </div>
-                      ) : files.length === 0 && !inlineCreate ? (
-                        <div className="ed-empty">
-                          <FileCode className="w-6 h-6" />
-                          <p className="text-xs">No files yet</p>
-                          <button type="button" className="btn-workspace btn-primary" onClick={() => startInlineCreate()}>Create File</button>
+                      </div>
+                      {showWelcomeExplorer ? (
+                        <div className="ed-welcome-explorer">
+                          <p className="ed-welcome-explorer-title">No project open</p>
+                          <p className="ed-welcome-explorer-copy">Your project files will appear here.</p>
+                          <button type="button" onClick={openProjectPicker}>Add Project</button>
                         </div>
                       ) : (
-                        <>
-                          {files.length === 0 && inlineCreate && (
-                            <InlineCreateRow
-                              kind={inlineCreate.kind}
-                              depth={0}
-                              value={inlineCreate.value}
-                              inputRef={inlineInputRef}
-                              onChange={(value) => setInlineCreate((prev) => (prev ? { ...prev, value } : prev))}
-                              onCommit={commitInlineCreate}
-                              onCancel={cancelInlineCreate}
-                            />
-                          )}
-                          {files.length > 0 && (
-                            <FileTreeNode node={tree} depth={-1} selectedId={selectedFile?._id} onSelect={selectFile} expanded={expandedFolders}
-                              onToggle={(path) => setExpandedFolders((prev) => ({ ...prev, [path]: prev[path] === false ? true : false }))}
-                              inlineCreate={inlineCreate}
-                              inlineInputRef={inlineInputRef}
-                              onInlineChange={(value) => setInlineCreate((prev) => (prev ? { ...prev, value } : prev))}
-                              onInlineCommit={commitInlineCreate}
-                              onInlineCancel={cancelInlineCreate} />
-                          )}
-                        </>
-                      )}
-                    </div>
-                  </div>
-                </>
-              )}
-
-              {activeSidebar === 'search' && (
-                <>
-                  <div className="ed-sidebar-head">
-                    <span className="ed-sidebar-title">Search</span>
-                    <div className="ed-sidebar-actions"></div>
-                  </div>
-                  <div className="ed-sidebar-body ed-search-body">
-                    <form
-                      className="ed-search-input-icon"
-                      onSubmit={(event) => {
-                        event.preventDefault();
-                        const query = searchQuery.trim();
-                        if (query) {
-                          setRecentSearches((previous) => [query, ...previous.filter((item) => item !== query)].slice(0, 8));
-                        }
-                      }}
-                    >
-                      <Search className="w-3.5 h-3.5" />
-                      <input
-                        type="text"
-                        className="ed-search-input"
-                        placeholder="Search"
-                        value={searchQuery}
-                        onChange={(e) => setSearchQuery(e.target.value)}
-                        aria-label="Search files and open file contents"
-                        autoFocus
-                      />
-                    </form>
-                    <div className="ed-search-section-title">
-                      <span>{searchQuery.trim() ? 'Results' : 'Recent searches'}</span>
-                      {searchQuery.trim() && <span>{searchMatches.length}</span>}
-                    </div>
-                    {searchQuery.trim() ? (
-                      searchMatches.length ? (
-                        <div className="ed-search-list">
-                          {searchMatches.map((match) => (
-                            <button
-                              key={match.key}
-                              type="button"
-                              className="ed-search-result"
-                              onClick={() => {
-                                const query = searchQuery.trim();
-                                if (query) {
-                                  setRecentSearches((previous) => [query, ...previous.filter((item) => item !== query)].slice(0, 8));
-                                }
-                                selectFile(match.file);
-                              }}
-                              title={match.lineNumber ? `${match.path}:${match.lineNumber}` : match.path}
-                            >
-                              {getLanguageGlyph(match.file.name)}
-                              <span className="ed-search-result-copy">
-                                <span className="ed-search-path">{match.path}</span>
-                                <span className="ed-search-preview">
-                                  {match.lineNumber && <small>{match.lineNumber}</small>}
-                                  <code>{match.excerpt}</code>
-                                </span>
-                              </span>
+                        <div className="ed-sidebar-body" style={{ padding: '0.6rem 0.75rem 0.4rem' }}>
+                          <div className="ed-project-wrap" ref={dropdownRef}>
+                            <button type="button" className="ed-project-btn" onClick={() => setShowProjectSelector(!showProjectSelector)}>
+                              <FolderOpen className="w-3.5 h-3.5" />
+                              <span className="ed-project-label">{selectedProject ? selectedProject.name : selectedRepo ? (selectedRepo.fullName || selectedRepo.name) : 'Workspace'}</span>
+                              <ChevronDown className={`w-3 h-3 transition-transform ${showProjectSelector ? 'rotate-180' : ''}`} style={{ color: '#748194' }} />
                             </button>
-                          ))}
-                        </div>
-                      ) : (
-                        <div className="ed-search-empty">No matching files or open-file content.</div>
-                      )
-                    ) : recentSearches.length ? (
-                      <div className="ed-search-list">
-                        {recentSearches.map((query) => (
-                          <button
-                            key={query}
-                            type="button"
-                            className="ed-search-recent"
-                            onClick={() => setSearchQuery(query)}
-                          >
-                            <Search className="w-3.5 h-3.5" />
-                            <span>{query}</span>
-                          </button>
-                        ))}
-                      </div>
-                    ) : (
-                      <>
-                        {openFiles.length > 0 && <div className="ed-search-subtitle">Recently opened</div>}
-                        <div className="ed-search-list">
-                          {openFiles.slice(-10).reverse().map((file) => {
-                            const key = getFileKey(file);
-                            const source = key === getFileKey(selectedFile)
-                              ? content
-                              : openContentsRef.current[key] ?? file.content ?? '';
-                            const preview = String(source).split(/\r?\n/).find((line) => line.trim()) || file.name;
-                            return (
-                              <button
-                                key={key}
-                                type="button"
-                                className="ed-search-result"
-                                onClick={() => selectFile(file)}
-                              >
-                                {getLanguageGlyph(file.name)}
-                                <span className="ed-search-result-copy">
-                                  <span className="ed-search-path">{file.fullPath || file._fullPath || fileFullPath(file)}</span>
-                                  <span className="ed-search-preview"><code>{preview}</code></span>
-                                </span>
-                              </button>
-                            );
-                          })}
-                          {openFiles.length === 0 && (
-                            <div className="ed-search-empty">Search files by name, path, or content in open files.</div>
-                          )}
-                        </div>
-                      </>
-                    )}
-                  </div>
-                </>
-              )}
-
-              {activeSidebar === 'scm' && (
-                <>
-                  <div className="ed-sidebar-head">
-                    <span className="ed-sidebar-title">Source Control</span>
-                    <div className="ed-sidebar-actions">
-                      <button type="button" className="ed-sidebar-btn" onClick={() => handleGitAction('status')} title="Refresh status"><RefreshCw className="w-3.5 h-3.5" /></button>
-                    </div>
-                  </div>
-                  <div className="ed-sidebar-body ed-scm-body">
-                    <div className="ed-scm-summary">
-                      <span className="ed-badge-dot" style={{ background: '#12dce5' }} />
-                      <b>{gitStatus?.branch || 'main'}</b>
-                      <span className="ed-scm-remote">
-                        {gitStatus?.repo
-                          ? gitStatus.repo
-                          : gitStatus ? `${gitStatus.ahead || 0}↑ ${gitStatus.behind || 0}↓` : 'no git info'}
-                      </span>
-                    </div>
-
-                    <div className="ed-scm-commit-box">
-                      <textarea
-                        className="ed-scm-commit-input"
-                        rows={3}
-                        placeholder={selectedRepo
-                          ? `Commit message — pushes to ${selectedRepo.fullName || selectedRepo.name} (Ctrl+Enter)`
-                          : 'Commit message (Ctrl+Enter)'}
-                        value={commitMsg}
-                        onChange={(e) => setCommitMsg(e.target.value)}
-                        onKeyDown={(e) => {
-                          if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-                            e.preventDefault();
-                            handleGitAction('commit');
-                          }
-                        }}
-                      />
-                      <button
-                        type="button"
-                        className="btn-workspace btn-primary ed-scm-commit-btn"
-                        onClick={() => handleGitAction('commit')}
-                        disabled={stagedCount === 0 || !(commitMsg || '').trim()}
-                        title={stagedCount === 0
-                          ? 'Stage changes before committing'
-                          : (commitMsg || '').trim() ? 'Commit (Ctrl+Enter)' : 'Write a commit message'}
-                      >
-                        <GitCommit className="w-3.5 h-3.5 mr-1 inline" />
-                        {selectedRepo ? 'Commit & Push' : 'Commit'}
-                      </button>
-                    </div>
-
-                    {!gitStatus && (
-                      <div className="ed-empty">
-                        <GitBranch className="w-6 h-6" />
-                        <p className="text-xs">No git information yet — press refresh.</p>
-                      </div>
-                    )}
-
-                    {scmEntries.length === 0 && (
-                      <p className="ed-scm-clean">
-                        {gitStatus ? 'Working tree clean' : 'No changes'}
-                      </p>
-                    )}
-                    {[
-                      { title: 'Staged Changes', entries: stagedEntries, isStaged: true },
-                      { title: 'Changes', entries: unstagedEntries, isStaged: false },
-                    ].map(({ title, entries, isStaged }) => (
-                      <div key={title}>
-                        <div className="ed-scm-section">
-                          <span>{title} ({entries.length})</span>
-                        </div>
-                        <div className="ed-scm-files">
-                          {entries.map(({ name, letter, color }) => (
-                            <div key={`${title}:${letter}:${name}`} className="ed-scm-file-row">
-                              <button
-                                type="button"
-                                className="ed-scm-file ed-scm-file-btn"
-                                onClick={() => loadFileDiff(name)}
-                                title={`View diff — ${letter}`}
-                              >
-                                <span className="ed-scm-status" style={{ color }}>{letter}</span>
-                                <span className="ed-scm-name">{name}</span>
-                              </button>
-                              <button
-                                type="button"
-                                className="ed-scm-stage-btn"
-                                onClick={() => toggleFileStage(name, isStaged)}
-                                aria-label={`${isStaged ? 'Unstage' : 'Stage'} ${name}`}
-                                title={`${isStaged ? 'Unstage' : 'Stage'} changes`}
-                              >
-                                {isStaged ? <Minus className="w-3.5 h-3.5" /> : <Plus className="w-3.5 h-3.5" />}
-                              </button>
-                            </div>
-                          ))}
-                          {!entries.length && <p className="ed-scm-clean">No files</p>}
-                        </div>
-                      </div>
-                    ))}
-
-                    {(gitStatus?.commits || []).length > 0 && (
-                      <div className="ed-scm-commits">
-                        <div className="ed-scm-section"><span>Recent commits</span></div>
-                        {gitStatus.commits.slice(0, 8).map((c) => (
-                          <div
-                            key={c.sha || c.hash}
-                            className="ed-scm-commit"
-                            title={c.url || c.message || ''}
-                            onClick={() => { if (c.url) window.open(c.url, '_blank'); }}
-                          >
-                            <span className="ed-scm-commit-msg">
-                              {(c.message || '').split('\n')[0]}
-                            </span>
-                            <span className="ed-scm-commit-meta">
-                              {(c.sha || c.hash || '').slice(0, 7)} · {c.author?.name || c.author?.username || c.author_name || ''}
-                            </span>
+                            {showProjectSelector && (
+                              <div className="ed-drop">
+                                <button type="button" className="ed-drop-item" onClick={() => requestScopeSwitch(() => { setSelectedProject(null); setSelectedRepo(null); setShowProjectSelector(false); })}>
+                                  <FolderOpen className="w-3.5 h-3.5" /> Workspace Files
+                                </button>
+                                {(workspaceId || selectedProject) && (
+                                  <button type="button" className="ed-drop-item" onClick={() => { setShowProjectSelector(false); setRepoCreateOpen(true); }}>
+                                    <GitBranch className="w-3.5 h-3.5" /> Create GitHub Repo
+                                  </button>
+                                )}
+                                {projects.length > 0 && <div className="ed-drop-section">Projects</div>}
+                                {projects.map((p) => (
+                                  <button key={p._id || p.id} type="button" className="ed-drop-item" onClick={() => requestScopeSwitch(() => { setSelectedProject(p); setSelectedRepo(null); setShowProjectSelector(false); })}>
+                                    <Folder className="w-3.5 h-3.5" /> {p.name}
+                                  </button>
+                                ))}
+                                {githubRepos.length > 0 && <div className="ed-drop-section">GitHub Repos</div>}
+                                {githubRepos.map((r) => (
+                                  <button key={r.id || r.fullName} type="button" className="ed-drop-item" onClick={() => requestScopeSwitch(() => { setSelectedRepo(r); setSelectedProject(null); setShowProjectSelector(false); })}>
+                                    <GitBranch className="w-3.5 h-3.5" /> {r.fullName || r.name}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
                           </div>
-                        ))}
+                          <div className="ed-filter-wrap">
+                            <input type="text" className="ed-filter" placeholder="Filter files..."
+                              value={fileFilter} onChange={(e) => setFileFilter(e.target.value)} />
+                          </div>
+                          <div className="ed-tree">
+                            {loading ? (
+                              <div className="ed-empty">
+                                <Loader2 className="w-5 h-5 animate-spin" />
+                                <span className="text-xs">Loading files...</span>
+                              </div>
+                            ) : files.length === 0 && !inlineCreate ? (
+                              <div className="ed-empty">
+                                <FileCode className="w-6 h-6" />
+                                <p className="text-xs">No files yet</p>
+                                <button type="button" className="btn-workspace btn-primary" onClick={() => startInlineCreate()}>Create File</button>
+                              </div>
+                            ) : (
+                              <>
+                                {files.length === 0 && inlineCreate && (
+                                  <InlineCreateRow
+                                    kind={inlineCreate.kind}
+                                    depth={0}
+                                    value={inlineCreate.value}
+                                    inputRef={inlineInputRef}
+                                    onChange={(value) => setInlineCreate((prev) => (prev ? { ...prev, value } : prev))}
+                                    onCommit={commitInlineCreate}
+                                    onCancel={cancelInlineCreate}
+                                  />
+                                )}
+                                {files.length > 0 && (
+                                  <FileTreeNode node={tree} depth={-1} selectedId={selectedFile?._id} onSelect={selectFile} expanded={expandedFolders}
+                                    onToggle={(path) => setExpandedFolders((prev) => ({ ...prev, [path]: prev[path] === false ? true : false }))}
+                                    inlineCreate={inlineCreate}
+                                    inlineInputRef={inlineInputRef}
+                                    onInlineChange={(value) => setInlineCreate((prev) => (prev ? { ...prev, value } : prev))}
+                                    onInlineCommit={commitInlineCreate}
+                                    onInlineCancel={cancelInlineCreate} />
+                                )}
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  {activeSidebar === 'search' && (
+                    <>
+                      <div className="ed-sidebar-head">
+                        <span className="ed-sidebar-title">Search</span>
+                        <div className="ed-sidebar-actions"></div>
                       </div>
-                    )}
-
-                    <div className="ed-scm-actions">
-                      <button type="button" className="btn-workspace btn-secondary" onClick={() => handleGitAction('pull')}>Pull</button>
-                      <button
-                        type="button"
-                        className="btn-workspace btn-secondary"
-                        onClick={() => handleGitAction('push')}
-                        disabled={!selectedRepo && !workspaceId}
-                      >
-                        Push
-                      </button>
-                    </div>
-
-                    {!selectedRepo && workspaceId && (
-                      <button type="button" className="btn-workspace btn-secondary ed-scm-wide" onClick={() => setRepoCreateOpen(true)}>
-                        <GitBranch className="w-3.5 h-3.5 mr-1 inline" /> Create GitHub Repo
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      className="btn-workspace btn-secondary ed-scm-wide"
-                      onClick={() => { setPrError(null); setPrDone(null); setPrOpen(true); }}
-                      disabled={!selectedRepo}
-                      title={selectedRepo ? 'Open pull request from current branch' : 'Select a GitHub repository in the Explorer first'}
-                    >
-                      <GitPullRequestArrow className="w-3.5 h-3.5 mr-1 inline" />
-                      Create Pull Request
-                    </button>
-                  </div>
-                </>
-              )}
-
-              {activeSidebar === 'debug' && (
-                <>
-                  <div className="ed-sidebar-head">
-                    <span className="ed-sidebar-title">Debug</span>
-                    <div className="ed-sidebar-actions">
-                      <button type="button" className="ed-sidebar-btn" onClick={() => loadDeployments({ forceRefresh: true })} title="Refresh deployments"><RefreshCw className="w-3.5 h-3.5" /></button>
-                    </div>
-                  </div>
-                  <div className="ed-sidebar-body">
-                    <div className="ed-stat">
-                      <span className="ed-badge-dot" style={{ background: blockCount ? '#e5b84a' : '#28c840' }} />
-                      {blockCount ? `${blockCount} language(s) locked on your tier` : 'All languages unlocked'}
-                    </div>
-                    <button
-                      type="button"
-                      className="btn-workspace btn-primary"
-                      onClick={handleRun}
-                      style={{ background: running ? '#b45309' : '#16a34a', color: '#fff' }}
-                    >
-                      {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-                      {running ? 'Stop Run' : 'Run File (⌘R)'}
-                    </button>
-                    <button type="button" className="btn-workspace btn-primary" onClick={handleSandboxStart}>
-                      <Box className="w-4 h-4" /> Start Sandbox
-                    </button>
-                    {deployScopeId && (
-                      <button
-                        type="button"
-                        className="btn-workspace btn-secondary"
-                        onClick={() => setAutoDeploy(!autoDeployOn)}
-                        aria-pressed={autoDeployOn}
-                        title={autoDeployOn ? 'Auto-deploy is ON: saving republishes this workspace' : 'Auto-deploy is OFF: save without republishing'}
-                      >
-                        Auto-Deploy {autoDeployOn ? 'ON' : 'OFF'}
-                      </button>
-                    )}
-                    {sandboxUrl && (
-                      <button type="button" className="btn-workspace btn-secondary" onClick={() => showSidebar('debug')}>
-                        <Eye className="w-4 h-4" /> Open Live Preview
-                      </button>
-                    )}
-                    {sandboxUrl && (
-                      <iframe
-                        src={sandboxUrl}
-                        title="Live preview"
-                        style={{ width: '100%', minHeight: 180, border: '1px solid rgba(255,255,255,0.09)', borderRadius: 6, background: '#fff' }}
-                      />
-                    )}
-                    <div className="ed-sidebar-title" style={{ padding: '0.1rem 0.55rem' }}>Tools</div>
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.35rem' }}>
-                      <button type="button" className="btn-workspace btn-secondary" onClick={() => showSidebar('live')}>
-                        <Users className="w-3.5 h-3.5" /> Live Share{collaborators.length > 0 ? ` (${collaborators.length})` : ''}
-                      </button>
-                      <button type="button" className="btn-workspace btn-secondary" onClick={() => showSidebar('ai')}>
-                        <Bot className="w-3.5 h-3.5" /> AI Assistant{aiLoading ? ' ·' : ''}
-                      </button>
-                      <button type="button" className="btn-workspace btn-secondary" onClick={() => showSidebar('extensions')}>
-                        <Puzzle className="w-3.5 h-3.5" /> Extensions
-                      </button>
-                    </div>
-                    {showSubdomainInput && (
-                      <form onSubmit={confirmDeploy} className="ed-stat" style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
-                        <label className="ws-label" style={{ color: '#9aaeba' }}>Choose a subdomain</label>
-                        {(() => {
-                          const secretFiles = gatherDeploymentFiles().filter((f) =>
-                            /(^|\/)\.env(\.|$)/i.test(`${f.path || ''}/${f.name || ''}`));
-                          return secretFiles.length > 0 ? (
-                            <p className="text-xs" style={{ color: '#e5b84a' }}>
-                              Includes {secretFiles.length} secret file{secretFiles.length === 1 ? '' : 's'}
-                              {secretFiles[0]?.name ? ` (${secretFiles.slice(0, 3).map((f) => f.name).join(', ')})` : ''} — values ship with this deploy.
-                            </p>
-                          ) : null;
-                        })()}
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                      <div className="ed-sidebar-body ed-search-body">
+                        <form
+                          className="ed-search-input-icon"
+                          onSubmit={(event) => {
+                            event.preventDefault();
+                            const query = searchQuery.trim();
+                            if (query) {
+                              setRecentSearches((previous) => [query, ...previous.filter((item) => item !== query)].slice(0, 8));
+                            }
+                          }}
+                        >
+                          <Search className="w-3.5 h-3.5" />
                           <input
                             type="text"
-                            value={deploySubdomain}
-                            onChange={(e) => setDeploySubdomain(e.target.value.replace(/[^a-z0-9-]/g, '-').toLowerCase())}
-                            placeholder="my-app"
-                            className="ws-input"
-                            style={{ minWidth: 0, flex: 1, fontFamily: 'var(--figma-font-mono)', background: '#0a0d15', borderColor: '#2a3446' }}
-                            required
-                            minLength={2}
+                            className="ed-search-input"
+                            placeholder="Search"
+                            value={searchQuery}
+                            onChange={(e) => setSearchQuery(e.target.value)}
+                            aria-label="Search files and open file contents"
+                            autoFocus
                           />
-                          <span className="text-xs whitespace-nowrap" style={{ color: '#748194' }}>.buildrshq.dev</span>
-                          <button type="submit" disabled={deploying || deploySubdomain.length < 2} className="btn-workspace btn-primary">
-                            {deploying ? 'Deploying...' : 'Deploy'}
-                          </button>
-                          <button type="button" onClick={() => setShowSubdomainInput(false)} className="btn-workspace btn-secondary">
-                            Cancel
+                        </form>
+                        <div className="ed-search-section-title">
+                          <span>{searchQuery.trim() ? 'Results' : 'Recent searches'}</span>
+                          {searchQuery.trim() && <span>{searchMatches.length}</span>}
+                        </div>
+                        {searchQuery.trim() ? (
+                          searchMatches.length ? (
+                            <div className="ed-search-list">
+                              {searchMatches.map((match) => (
+                                <button
+                                  key={match.key}
+                                  type="button"
+                                  className="ed-search-result"
+                                  onClick={() => {
+                                    const query = searchQuery.trim();
+                                    if (query) {
+                                      setRecentSearches((previous) => [query, ...previous.filter((item) => item !== query)].slice(0, 8));
+                                    }
+                                    selectFile(match.file);
+                                  }}
+                                  title={match.lineNumber ? `${match.path}:${match.lineNumber}` : match.path}
+                                >
+                                  {getLanguageGlyph(match.file.name)}
+                                  <span className="ed-search-result-copy">
+                                    <span className="ed-search-path">{match.path}</span>
+                                    <span className="ed-search-preview">
+                                      {match.lineNumber && <small>{match.lineNumber}</small>}
+                                      <code>{match.excerpt}</code>
+                                    </span>
+                                  </span>
+                                </button>
+                              ))}
+                            </div>
+                          ) : (
+                            <div className="ed-search-empty">No matching files or open-file content.</div>
+                          )
+                        ) : recentSearches.length ? (
+                          <div className="ed-search-list">
+                            {recentSearches.map((query) => (
+                              <button
+                                key={query}
+                                type="button"
+                                className="ed-search-recent"
+                                onClick={() => setSearchQuery(query)}
+                              >
+                                <Search className="w-3.5 h-3.5" />
+                                <span>{query}</span>
+                              </button>
+                            ))}
+                          </div>
+                        ) : (
+                          <>
+                            {openFiles.length > 0 && <div className="ed-search-subtitle">Recently opened</div>}
+                            <div className="ed-search-list">
+                              {openFiles.slice(-10).reverse().map((file) => {
+                                const key = getFileKey(file);
+                                const source = key === getFileKey(selectedFile)
+                                  ? content
+                                  : openContentsRef.current[key] ?? file.content ?? '';
+                                const preview = String(source).split(/\r?\n/).find((line) => line.trim()) || file.name;
+                                return (
+                                  <button
+                                    key={key}
+                                    type="button"
+                                    className="ed-search-result"
+                                    onClick={() => selectFile(file)}
+                                  >
+                                    {getLanguageGlyph(file.name)}
+                                    <span className="ed-search-result-copy">
+                                      <span className="ed-search-path">{file.fullPath || file._fullPath || fileFullPath(file)}</span>
+                                      <span className="ed-search-preview"><code>{preview}</code></span>
+                                    </span>
+                                  </button>
+                                );
+                              })}
+                              {openFiles.length === 0 && (
+                                <div className="ed-search-empty">Search files by name, path, or content in open files.</div>
+                              )}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    </>
+                  )}
+
+                  {activeSidebar === 'scm' && (
+                    <>
+                      <div className="ed-sidebar-head">
+                        <span className="ed-sidebar-title">Source Control</span>
+                        <div className="ed-sidebar-actions">
+                          <button type="button" className="ed-sidebar-btn" onClick={() => handleGitAction('status')} title="Refresh status"><RefreshCw className="w-3.5 h-3.5" /></button>
+                        </div>
+                      </div>
+                      <div className="ed-sidebar-body ed-scm-body">
+                        <div className="ed-scm-summary">
+                          <span className="ed-badge-dot" style={{ background: '#12dce5' }} />
+                          <b>{gitStatus?.branch || 'main'}</b>
+                          <span className="ed-scm-remote">
+                            {gitStatus?.repo
+                              ? gitStatus.repo
+                              : gitStatus ? `${gitStatus.ahead || 0}↑ ${gitStatus.behind || 0}↓` : 'no git info'}
+                          </span>
+                        </div>
+
+                        <div className="ed-scm-commit-box">
+                          <textarea
+                            className="ed-scm-commit-input"
+                            rows={3}
+                            placeholder={selectedRepo
+                              ? `Commit message — pushes to ${selectedRepo.fullName || selectedRepo.name} (Ctrl+Enter)`
+                              : 'Commit message (Ctrl+Enter)'}
+                            value={commitMsg}
+                            onChange={(e) => setCommitMsg(e.target.value)}
+                            onKeyDown={(e) => {
+                              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                                e.preventDefault();
+                                handleGitAction('commit');
+                              }
+                            }}
+                          />
+                          <button
+                            type="button"
+                            className="btn-workspace btn-primary ed-scm-commit-btn"
+                            onClick={() => handleGitAction('commit')}
+                            disabled={stagedCount === 0 || !(commitMsg || '').trim()}
+                            title={stagedCount === 0
+                              ? 'Stage changes before committing'
+                              : (commitMsg || '').trim() ? 'Commit (Ctrl+Enter)' : 'Write a commit message'}
+                          >
+                            <GitCommit className="w-3.5 h-3.5 mr-1 inline" />
+                            {selectedRepo ? 'Commit & Push' : 'Commit'}
                           </button>
                         </div>
-                      </form>
-                    )}
-                    <div className="ed-sidebar-title" style={{ padding: '0.1rem 0.55rem' }}>Deployments</div>
-                    {deployments.length === 0 ? (
-                      <p className="text-xs" style={{ color: '#748194', padding: '0.2rem 0.55rem' }}>Nothing deployed yet</p>
-                    ) : (
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
-                        {deployments.slice(0, 4).map((d, i) => (
-                          <div
-                            key={i}
-                            className="ed-scm-file"
-                            style={{ cursor: 'pointer' }}
-                            title="View build & runtime logs"
-                            onClick={() => setLogDeployId(d._id)}
-                          >
-                            <span className="ed-badge-dot" style={{ background: d.status === 'success' ? '#28c840' : d.status === 'failed' ? '#ec1414' : '#e5b84a' }} />
-                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.subdomain ? `${d.subdomain}.buildrshq.dev` : d._id || 'Deployment'}</span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                    <button type="button" className="btn-workspace btn-secondary" onClick={handleDeploy}>
-                      <Rocket className="w-4 h-4" /> Deploy Project
-                    </button>
-                  </div>
-                </>
-              )}
 
-              {activeSidebar === 'live' && (
-                <>
-                  <div className="ed-sidebar-head">
-                    <span className="ed-sidebar-title">Live Share</span>
-                    <div className="ed-sidebar-actions"></div>
-                  </div>
-                  <div className="ed-sidebar-body">
-                    <div className="ed-stat">
-                      <span className="ed-badge-dot" style={{ background: '#28c840' }} />
-                      {collaborators.length} collaborator(s) · {Object.keys(remoteCursors).length} remote cursor(s)
-                    </div>
-                    <div className="ed-stat" style={{ lineHeight: 1.8 }}>
-                      <span style={{ color: '#748194' }}>Invite link</span>
-                      <input
-                        readOnly
-                        value={selectedFile ? `${window.location.origin}/editor?file=${selectedFile._id}` : `${window.location.origin}/editor`}
-                        onFocus={(e) => e.target.select()}
-                        style={{ width: '100%', background: 'transparent', border: 'none', outline: 'none', color: '#c7d2dd', fontSize: '0.68rem' }}
-                      />
-                    </div>
-                    <button
-                      type="button"
-                      className="btn-workspace btn-primary"
-                      onClick={() => {
-                        navigator.clipboard?.writeText(selectedFile ? `${window.location.origin}/editor?file=${selectedFile._id}` : `${window.location.origin}/editor`);
-                        setStatus({ type: 'success', msg: 'Invite link copied' });
-                        setTimeout(() => setStatus(null), 2000);
-                      }}
-                    >
-                      Copy Link
-                    </button>
-                    {isWorkspaceFile && (
-                      <>
-                        <div className="ed-sidebar-title" style={{ padding: '0.1rem 0.55rem' }}>File access</div>
-                        {!fileAccess?.canManage && (
-                          <p className="text-xs" style={{ color: '#748194', padding: '0.2rem 0.55rem', lineHeight: 1.5 }}>
-                            {fileAccess
-                              ? 'Only the file owner or workspace admins can change who can edit this file.'
-                              : 'Checking file permissions…'}
+                        {!gitStatus && (
+                          <div className="ed-empty">
+                            <GitBranch className="w-6 h-6" />
+                            <p className="text-xs">No git information yet — press refresh.</p>
+                          </div>
+                        )}
+
+                        {scmEntries.length === 0 && (
+                          <p className="ed-scm-clean">
+                            {gitStatus ? 'Working tree clean' : 'No changes'}
                           </p>
                         )}
-                        {fileSharingRows.length === 0 ? (
-                          <p className="text-xs" style={{ color: '#748194', padding: '0.2rem 0.55rem' }}>
-                            No teammates to share this file with.
-                          </p>
-                        ) : (
-                          fileSharingRows.map((row) => (
-                            <div key={row.id} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.3rem 0.55rem' }}>
-                              <div style={{ minWidth: 0, flex: 1 }}>
-                                <div className="text-xs" style={{ color: '#c7d2dd', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                  {row.name}
+                        {[
+                          { title: 'Staged Changes', entries: stagedEntries, isStaged: true },
+                          { title: 'Changes', entries: unstagedEntries, isStaged: false },
+                        ].map(({ title, entries, isStaged }) => (
+                          <div key={title}>
+                            <div className="ed-scm-section">
+                              <span>{title} ({entries.length})</span>
+                            </div>
+                            <div className="ed-scm-files">
+                              {entries.map(({ name, letter, color }) => (
+                                <div key={`${title}:${letter}:${name}`} className="ed-scm-file-row">
+                                  <button
+                                    type="button"
+                                    className="ed-scm-file ed-scm-file-btn"
+                                    onClick={() => loadFileDiff(name)}
+                                    title={`View diff — ${letter}`}
+                                  >
+                                    <span className="ed-scm-status" style={{ color }}>{letter}</span>
+                                    <span className="ed-scm-name">{name}</span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="ed-scm-stage-btn"
+                                    onClick={() => toggleFileStage(name, isStaged)}
+                                    aria-label={`${isStaged ? 'Unstage' : 'Stage'} ${name}`}
+                                    title={`${isStaged ? 'Unstage' : 'Stage'} changes`}
+                                  >
+                                    {isStaged ? <Minus className="w-3.5 h-3.5" /> : <Plus className="w-3.5 h-3.5" />}
+                                  </button>
                                 </div>
-                                {row.email && (
-                                  <div className="text-xs" style={{ color: '#748194', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                    {row.email}
-                                  </div>
-                                )}
-                              </div>
-                              <select
-                                aria-label={`Access for ${row.name}`}
-                                value={row.permission || ''}
-                                disabled={!fileAccess?.canManage || sharingBusy === row.id}
-                                onChange={(e) => updateFileCollaborator(row.id, e.target.value)}
-                                style={{
-                                  background: '#0a0d15',
-                                  color: '#c7d2dd',
-                                  border: '1px solid rgba(255,255,255,0.12)',
-                                  borderRadius: 6,
-                                  fontSize: '0.66rem',
-                                  padding: '0.2rem 0.25rem',
-                                  maxWidth: 96,
-                                }}
+                              ))}
+                              {!entries.length && <p className="ed-scm-clean">No files</p>}
+                            </div>
+                          </div>
+                        ))}
+
+                        {(gitStatus?.commits || []).length > 0 && (
+                          <div className="ed-scm-commits">
+                            <div className="ed-scm-section"><span>Recent commits</span></div>
+                            {gitStatus.commits.slice(0, 8).map((c) => (
+                              <div
+                                key={c.sha || c.hash}
+                                className="ed-scm-commit"
+                                title={c.url || c.message || ''}
+                                onClick={() => { if (c.url) window.open(c.url, '_blank'); }}
                               >
-                                <option value="">No access</option>
-                                <option value="read">Can view</option>
-                                <option value="write">Can edit</option>
-                                {row.permission === 'admin' && <option value="admin">Can manage</option>}
-                              </select>
+                                <span className="ed-scm-commit-msg">
+                                  {(c.message || '').split('\n')[0]}
+                                </span>
+                                <span className="ed-scm-commit-meta">
+                                  {(c.sha || c.hash || '').slice(0, 7)} · {c.author?.name || c.author?.username || c.author_name || ''}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        <div className="ed-scm-actions">
+                          <button type="button" className="btn-workspace btn-secondary" onClick={() => handleGitAction('pull')}>Pull</button>
+                          <button
+                            type="button"
+                            className="btn-workspace btn-secondary"
+                            onClick={() => handleGitAction('push')}
+                            disabled={!selectedRepo && !workspaceId}
+                          >
+                            Push
+                          </button>
+                        </div>
+
+                        {!selectedRepo && workspaceId && (
+                          <button type="button" className="btn-workspace btn-secondary ed-scm-wide" onClick={() => setRepoCreateOpen(true)}>
+                            <GitBranch className="w-3.5 h-3.5 mr-1 inline" /> Create GitHub Repo
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="btn-workspace btn-secondary ed-scm-wide"
+                          onClick={() => { setPrError(null); setPrDone(null); setPrOpen(true); }}
+                          disabled={!selectedRepo}
+                          title={selectedRepo ? 'Open pull request from current branch' : 'Select a GitHub repository in the Explorer first'}
+                        >
+                          <GitPullRequestArrow className="w-3.5 h-3.5 mr-1 inline" />
+                          Create Pull Request
+                        </button>
+                      </div>
+                    </>
+                  )}
+
+                  {activeSidebar === 'debug' && (
+                    <>
+                      <div className="ed-sidebar-head">
+                        <span className="ed-sidebar-title">Debug</span>
+                        <div className="ed-sidebar-actions">
+                          <button type="button" className="ed-sidebar-btn" onClick={() => loadDeployments({ forceRefresh: true })} title="Refresh deployments"><RefreshCw className="w-3.5 h-3.5" /></button>
+                        </div>
+                      </div>
+                      <div className="ed-sidebar-body">
+                        <div className="ed-stat">
+                          <span className="ed-badge-dot" style={{ background: blockCount ? '#e5b84a' : '#28c840' }} />
+                          {blockCount ? `${blockCount} language(s) locked on your tier` : 'All languages unlocked'}
+                        </div>
+                        <button
+                          type="button"
+                          className="btn-workspace btn-primary"
+                          onClick={handleRun}
+                          style={{ background: running ? '#b45309' : '#16a34a', color: '#fff' }}
+                        >
+                          {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                          {running ? 'Stop Run' : 'Run File (⌘R)'}
+                        </button>
+                        <button type="button" className="btn-workspace btn-primary" onClick={handleProjectPreview}>
+                          <Eye className="w-4 h-4" /> Preview Project
+                        </button>
+                        {deployScopeId && (
+                          <button
+                            type="button"
+                            className="btn-workspace btn-secondary"
+                            onClick={() => setAutoDeploy(!autoDeployOn)}
+                            aria-pressed={autoDeployOn}
+                            title={autoDeployOn ? 'Auto-deploy is ON: saving republishes this workspace' : 'Auto-deploy is OFF: save without republishing'}
+                          >
+                            Auto-Deploy {autoDeployOn ? 'ON' : 'OFF'}
+                          </button>
+                        )}
+                        {sandboxUrl && (
+                          <button type="button" className="btn-workspace btn-secondary" onClick={() => openPreviewInNewTab(sandboxUrl)}>
+                            <Eye className="w-4 h-4" /> Open Preview in New Tab
+                          </button>
+                        )}
+                        {sandboxUrl && (
+                          <iframe
+                            src={sandboxUrl}
+                            title="Live preview"
+                            style={{ width: '100%', minHeight: 180, border: '1px solid rgba(255,255,255,0.09)', borderRadius: 6, background: '#fff' }}
+                          />
+                        )}
+                        <div className="ed-sidebar-title" style={{ padding: '0.1rem 0.55rem' }}>Tools</div>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.35rem' }}>
+                          <button type="button" className="btn-workspace btn-secondary" onClick={() => showSidebar('live')}>
+                            <Users className="w-3.5 h-3.5" /> Live Share{collaborators.length > 0 ? ` (${collaborators.length})` : ''}
+                          </button>
+                          <button type="button" className="btn-workspace btn-secondary" onClick={() => showSidebar('ai')}>
+                            <Bot className="w-3.5 h-3.5" /> AI Assistant{aiLoading ? ' ·' : ''}
+                          </button>
+                          <button type="button" className="btn-workspace btn-secondary" onClick={() => showSidebar('extensions')}>
+                            <Puzzle className="w-3.5 h-3.5" /> Extensions
+                          </button>
+                        </div>
+                        {showSubdomainInput && (
+                          <form onSubmit={confirmDeploy} className="ed-stat" style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+                            <label className="ws-label" style={{ color: '#9aaeba' }}>Choose a subdomain</label>
+                            {(() => {
+                              const secretFiles = gatherDeploymentFiles().filter((f) =>
+                                isPrivateFile(f));
+                              return secretFiles.length > 0 ? (
+                                <p className="text-xs" style={{ color: '#e5b84a' }}>
+                                  Includes {secretFiles.length} secret file{secretFiles.length === 1 ? '' : 's'}
+                                  {secretFiles[0]?.name ? ` (${secretFiles.slice(0, 3).map((f) => f.name).join(', ')})` : ''} — values ship with this deploy.
+                                </p>
+                              ) : null;
+                            })()}
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                              <input
+                                type="text"
+                                value={deploySubdomain}
+                                onChange={(e) => setDeploySubdomain(e.target.value.replace(/[^a-z0-9-]/g, '-').toLowerCase())}
+                                placeholder="my-app"
+                                className="ws-input"
+                                style={{ minWidth: 0, flex: 1, fontFamily: 'var(--figma-font-mono)', background: '#0a0d15', borderColor: '#2a3446' }}
+                                required
+                                minLength={2}
+                              />
+                              <span className="text-xs whitespace-nowrap" style={{ color: '#748194' }}>.buildrshq.dev</span>
+                              <button type="submit" disabled={deploying || deploySubdomain.length < 2} className="btn-workspace btn-primary">
+                                {deploying ? 'Deploying...' : 'Deploy'}
+                              </button>
+                              <button type="button" onClick={() => setShowSubdomainInput(false)} className="btn-workspace btn-secondary">
+                                Cancel
+                              </button>
+                            </div>
+                          </form>
+                        )}
+                        <div className="ed-sidebar-title" style={{ padding: '0.1rem 0.55rem' }}>Deployments</div>
+                        {deployments.length === 0 ? (
+                          <p className="text-xs" style={{ color: '#748194', padding: '0.2rem 0.55rem' }}>Nothing deployed yet</p>
+                        ) : (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                            {deployments.slice(0, 4).map((d, i) => (
+                              <div
+                                key={i}
+                                className="ed-scm-file"
+                                style={{ cursor: 'pointer' }}
+                                title="View build & runtime logs"
+                                onClick={() => setLogDeployId(d._id)}
+                              >
+                                <span className="ed-badge-dot" style={{ background: d.status === 'success' ? '#28c840' : d.status === 'failed' ? '#ec1414' : '#e5b84a' }} />
+                                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.subdomain ? `${d.subdomain}.buildrshq.dev` : d._id || 'Deployment'}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        <button type="button" className="btn-workspace btn-secondary" onClick={handleDeploy}>
+                          <Rocket className="w-4 h-4" /> Deploy Project
+                        </button>
+                      </div>
+                    </>
+                  )}
+
+                  {activeSidebar === 'live' && (
+                    <>
+                      <div className="ed-sidebar-head">
+                        <span className="ed-sidebar-title">Live Share</span>
+                        <div className="ed-sidebar-actions"></div>
+                      </div>
+                      <div className="ed-sidebar-body">
+                        <div className="ed-stat">
+                          <span className="ed-badge-dot" style={{ background: '#28c840' }} />
+                          {collaborators.length} collaborator(s) · {Object.keys(remoteCursors).length} remote cursor(s)
+                        </div>
+                        <div className="ed-stat" style={{ lineHeight: 1.8 }}>
+                          <span style={{ color: '#748194' }}>Invite link</span>
+                          <input
+                            readOnly
+                            value={selectedFile ? `${window.location.origin}/editor?file=${selectedFile._id}` : `${window.location.origin}/editor`}
+                            onFocus={(e) => e.target.select()}
+                            style={{ width: '100%', background: 'transparent', border: 'none', outline: 'none', color: '#c7d2dd', fontSize: '0.68rem' }}
+                          />
+                        </div>
+                        <button
+                          type="button"
+                          className="btn-workspace btn-primary"
+                          onClick={() => {
+                            navigator.clipboard?.writeText(selectedFile ? `${window.location.origin}/editor?file=${selectedFile._id}` : `${window.location.origin}/editor`);
+                            setStatus({ type: 'success', msg: 'Invite link copied' });
+                            setTimeout(() => setStatus(null), 2000);
+                          }}
+                        >
+                          Copy Link
+                        </button>
+                        {isWorkspaceFile && (
+                          <>
+                            <div className="ed-sidebar-title" style={{ padding: '0.1rem 0.55rem' }}>File access</div>
+                            {!fileAccess?.canManage && (
+                              <p className="text-xs" style={{ color: '#748194', padding: '0.2rem 0.55rem', lineHeight: 1.5 }}>
+                                {fileAccess
+                                  ? 'Only the file owner or workspace admins can change who can edit this file.'
+                                  : 'Checking file permissions…'}
+                              </p>
+                            )}
+                            {fileSharingRows.length === 0 ? (
+                              <p className="text-xs" style={{ color: '#748194', padding: '0.2rem 0.55rem' }}>
+                                No teammates to share this file with.
+                              </p>
+                            ) : (
+                              fileSharingRows.map((row) => (
+                                <div key={row.id} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.3rem 0.55rem' }}>
+                                  <div style={{ minWidth: 0, flex: 1 }}>
+                                    <div className="text-xs" style={{ color: '#c7d2dd', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                      {row.name}
+                                    </div>
+                                    {row.email && (
+                                      <div className="text-xs" style={{ color: '#748194', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                        {row.email}
+                                      </div>
+                                    )}
+                                  </div>
+                                  <select
+                                    aria-label={`Access for ${row.name}`}
+                                    value={row.permission || ''}
+                                    disabled={!fileAccess?.canManage || sharingBusy === row.id}
+                                    onChange={(e) => updateFileCollaborator(row.id, e.target.value)}
+                                    style={{
+                                      background: '#0a0d15',
+                                      color: '#c7d2dd',
+                                      border: '1px solid rgba(255,255,255,0.12)',
+                                      borderRadius: 6,
+                                      fontSize: '0.66rem',
+                                      padding: '0.2rem 0.25rem',
+                                      maxWidth: 96,
+                                    }}
+                                  >
+                                    <option value="">No access</option>
+                                    <option value="read">Can view</option>
+                                    <option value="write">Can edit</option>
+                                    {row.permission === 'admin' && <option value="admin">Can manage</option>}
+                                  </select>
+                                </div>
+                              ))
+                            )}
+                          </>
+                        )}
+                        <div className="ed-sidebar-title" style={{ padding: '0.1rem 0.55rem' }}>Active</div>
+                        {collaborators.length === 0 ? (
+                          <p className="text-xs" style={{ color: '#748194', padding: '0.2rem 0.55rem' }}>No active collaborators yet</p>
+                        ) : (
+                          collaborators.map((c, i) => (
+                            <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', padding: '0.35rem 0.55rem' }}>
+                              <div className="ed-member-av" style={{ background: 'rgba(18,220,229,0.15)', color: '#12dce5', width: 26, height: 26, fontSize: '0.7rem' }}>{c.name?.[0] || 'U'}</div>
+                              <div style={{ minWidth: 0 }}>
+                                <div className="text-xs" style={{ color: '#c7d2dd', fontWeight: 600 }}>{c.name || 'Anonymous'}</div>
+                                {c.email && <div className="text-xs" style={{ color: '#748194' }}>{c.email}</div>}
+                              </div>
                             </div>
                           ))
                         )}
-                      </>
-                    )}
-                    <div className="ed-sidebar-title" style={{ padding: '0.1rem 0.55rem' }}>Active</div>
-                    {collaborators.length === 0 ? (
-                      <p className="text-xs" style={{ color: '#748194', padding: '0.2rem 0.55rem' }}>No active collaborators yet</p>
-                    ) : (
-                      collaborators.map((c, i) => (
-                        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', padding: '0.35rem 0.55rem' }}>
-                          <div className="ed-member-av" style={{ background: 'rgba(18,220,229,0.15)', color: '#12dce5', width: 26, height: 26, fontSize: '0.7rem' }}>{c.name?.[0] || 'U'}</div>
-                          <div style={{ minWidth: 0 }}>
-                            <div className="text-xs" style={{ color: '#c7d2dd', fontWeight: 600 }}>{c.name || 'Anonymous'}</div>
-                            {c.email && <div className="text-xs" style={{ color: '#748194' }}>{c.email}</div>}
+                        {Object.values(remoteCursors).filter((rc) => rc.userName !== (user?.fullName || user?.name)).map((rc, i) => (
+                          <div key={`cursor-${i}`} style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', padding: '0.35rem 0.55rem' }}>
+                            <div className="ed-member-av" style={{ background: 'rgba(138,56,245,0.15)', color: '#8a38f5', width: 26, height: 26, fontSize: '0.7rem' }}>{(rc.userName || 'U')[0]}</div>
+                            <div className="text-xs" style={{ color: '#9aaeba' }}>{rc.userName} @ line {rc.cursor?.line}, col {rc.cursor?.column}</div>
                           </div>
-                        </div>
-                      ))
-                    )}
-                    {Object.values(remoteCursors).filter((rc) => rc.userName !== (user?.fullName || user?.name)).map((rc, i) => (
-                      <div key={`cursor-${i}`} style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', padding: '0.35rem 0.55rem' }}>
-                        <div className="ed-member-av" style={{ background: 'rgba(138,56,245,0.15)', color: '#8a38f5', width: 26, height: 26, fontSize: '0.7rem' }}>{(rc.userName || 'U')[0]}</div>
-                        <div className="text-xs" style={{ color: '#9aaeba' }}>{rc.userName} @ line {rc.cursor?.line}, col {rc.cursor?.column}</div>
-                      </div>
-                    ))}
-                  </div>
-                </>
-              )}
-
-              {activeSidebar === 'ai' && (
-                <>
-                  <div className="ed-sidebar-head">
-                    <span className="ed-sidebar-title">AI Assistant</span>
-                    <div className="ed-sidebar-actions"></div>
-                  </div>
-                  <div className="ed-sidebar-body is-ai">
-                    {pendingConfirmations.length > 0 && (
-                      <div className="ed-ai-intel" style={{ marginBottom: '0.75rem', borderColor: 'rgba(245,158,11,0.5)' }}>
-                        <div className="ed-ai-intel-header">
-                          <AlertCircle className="w-4 h-4" style={{ color: '#e5b84a' }} />
-                          <span>Pending approvals</span>
-                        </div>
-                        <div className="ed-ai-suggestions" style={{ gap: '0.5rem' }}>
-                          {pendingConfirmations.slice(0, 3).map((confirmation) => (
-                            <div key={confirmation.id} className="ed-ai-prompt" style={{ display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: '0.5rem' }}>
-                              <div>
-                                <strong>{confirmation.tool || 'Agent action'}</strong>
-                                <small>{confirmation.preview?.action || 'A risky action needs your approval.'}</small>
-                              </div>
-                              <div style={{ display: 'flex', gap: '0.4rem' }}>
-                                <button type="button" className="btn-workspace btn-primary" style={{ flex: 1, minHeight: 0, padding: '0.38rem 0.6rem' }} onClick={() => respondToConfirmation(confirmation.id, true)}>
-                                  Approve
-                                </button>
-                                <button type="button" className="btn-workspace btn-secondary" style={{ flex: 1, minHeight: 0, padding: '0.38rem 0.6rem' }} onClick={() => respondToConfirmation(confirmation.id, false, 'Rejected from IDE approval panel')}>
-                                  Reject
-                                </button>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    <div className="ed-ai-intel" style={{ marginBottom: '0.75rem', borderColor: 'rgba(18,220,229,0.35)' }}>
-                      <div className="ed-ai-intel-header">
-                        <Bot className="w-4 h-4" style={{ color: '#68f7ff' }} />
-                        <span>Phase 2 task board</span>
-                      </div>
-                      <div style={{ display: 'grid', gap: '0.45rem', marginTop: '0.5rem' }}>
-                        {taskCards.map((task) => (
-                          <button
-                            key={task.id}
-                            type="button"
-                            className="ed-ai-prompt"
-                            onClick={() => handleTaskSelect(task.id)}
-                            style={{
-                              borderColor: selectedTaskId === task.id ? 'rgba(96,165,250,0.9)' : 'rgba(255,255,255,0.05)',
-                              background: selectedTaskId === task.id ? 'rgba(96,165,250,0.08)' : 'rgba(255,255,255,0.02)',
-                              textAlign: 'left',
-                            }}
-                          >
-                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%' }}>
-                              <strong>{task.title}</strong>
-                              <span className="pill pill-mono" style={{ background: task.priority === 'high' ? 'rgba(236,20,20,0.12)' : task.priority === 'medium' ? 'rgba(234,179,8,0.12)' : 'rgba(3,186,3,0.12)', color: task.priority === 'high' ? '#ec8f8f' : task.priority === 'medium' ? '#facc15' : '#56e5a9' }}>
-                                {task.priority}
-                              </span>
-                            </div>
-                            <small>{task.summary}</small>
-                          </button>
                         ))}
                       </div>
-                      <div style={{ display: 'flex', gap: '0.45rem', marginTop: '0.6rem' }}>
-                        <button type="button" className="btn-workspace btn-primary" style={{ flex: 1 }} onClick={runSelectedTask}>
-                          Run selected task
-                        </button>
-                        <button type="button" className="btn-workspace btn-secondary" style={{ flex: 1 }} onClick={() => setSpecMode((prev) => !prev)}>
-                          {specMode ? 'Spec on' : 'Spec mode'}
-                        </button>
+                    </>
+                  )}
+
+                  {activeSidebar === 'ai' && (
+                    <>
+                      <div className="ed-sidebar-head">
+                        <span className="ed-sidebar-title">AI Assistant</span>
+                        <div className="ed-sidebar-actions"></div>
                       </div>
-                      {specMode && (
-                        <div style={{ marginTop: '0.6rem', border: '1px solid rgba(96,165,250,0.25)', borderRadius: 8, background: 'rgba(96,165,250,0.05)', padding: '0.6rem' }}>
-                          <div style={{ color: '#c7d2dd', fontWeight: 600, marginBottom: '0.35rem' }}>Implementation contract</div>
-                          <div style={{ color: '#9aaeba', fontSize: '0.68rem', lineHeight: 1.5 }}>
-                            Scope: {selectedTask?.title || 'current task'}{selectedFile ? ` • file: ${selectedFile.name}` : ''}<br />
-                            Safety: require approval for destructive actions, validate changes, and keep the public contract stable.
+                      <div className="ed-sidebar-body is-ai">
+                        {pendingConfirmations.length > 0 && (
+                          <div className="ed-ai-intel" style={{ marginBottom: '0.75rem', borderColor: 'rgba(245,158,11,0.5)' }}>
+                            <div className="ed-ai-intel-header">
+                              <AlertCircle className="w-4 h-4" style={{ color: '#e5b84a' }} />
+                              <span>Pending approvals</span>
+                            </div>
+                            <div className="ed-ai-suggestions" style={{ gap: '0.5rem' }}>
+                              {pendingConfirmations.slice(0, 3).map((confirmation) => (
+                                <div key={confirmation.id} className="ed-ai-prompt" style={{ display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: '0.5rem' }}>
+                                  <div>
+                                    <strong>{confirmation.tool || 'Agent action'}</strong>
+                                    <small>{confirmation.preview?.action || 'A risky action needs your approval.'}</small>
+                                  </div>
+                                  <div style={{ display: 'flex', gap: '0.4rem' }}>
+                                    <button type="button" className="btn-workspace btn-primary" style={{ flex: 1, minHeight: 0, padding: '0.38rem 0.6rem' }} onClick={() => respondToConfirmation(confirmation.id, true)}>
+                                      Approve
+                                    </button>
+                                    <button type="button" className="btn-workspace btn-secondary" style={{ flex: 1, minHeight: 0, padding: '0.38rem 0.6rem' }} onClick={() => respondToConfirmation(confirmation.id, false, 'Rejected from IDE approval panel')}>
+                                      Reject
+                                    </button>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        <div className="ed-ai-intel" style={{ marginBottom: '0.75rem', borderColor: 'rgba(18,220,229,0.35)' }}>
+                          <div className="ed-ai-intel-header">
+                            <Bot className="w-4 h-4" style={{ color: '#68f7ff' }} />
+                            <span>Phase 2 task board</span>
+                          </div>
+                          <div style={{ display: 'grid', gap: '0.45rem', marginTop: '0.5rem' }}>
+                            {taskCards.map((task) => (
+                              <button
+                                key={task.id}
+                                type="button"
+                                className="ed-ai-prompt"
+                                onClick={() => handleTaskSelect(task.id)}
+                                style={{
+                                  borderColor: selectedTaskId === task.id ? 'rgba(96,165,250,0.9)' : 'rgba(255,255,255,0.05)',
+                                  background: selectedTaskId === task.id ? 'rgba(96,165,250,0.08)' : 'rgba(255,255,255,0.02)',
+                                  textAlign: 'left',
+                                }}
+                              >
+                                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%' }}>
+                                  <strong>{task.title}</strong>
+                                  <span className="pill pill-mono" style={{ background: task.priority === 'high' ? 'rgba(236,20,20,0.12)' : task.priority === 'medium' ? 'rgba(234,179,8,0.12)' : 'rgba(3,186,3,0.12)', color: task.priority === 'high' ? '#ec8f8f' : task.priority === 'medium' ? '#facc15' : '#56e5a9' }}>
+                                    {task.priority}
+                                  </span>
+                                </div>
+                                <small>{task.summary}</small>
+                              </button>
+                            ))}
+                          </div>
+                          <div style={{ display: 'flex', gap: '0.45rem', marginTop: '0.6rem' }}>
+                            <button type="button" className="btn-workspace btn-primary" style={{ flex: 1 }} onClick={runSelectedTask}>
+                              Run selected task
+                            </button>
+                            <button type="button" className="btn-workspace btn-secondary" style={{ flex: 1 }} onClick={() => setSpecMode((prev) => !prev)}>
+                              {specMode ? 'Spec on' : 'Spec mode'}
+                            </button>
+                          </div>
+                          {specMode && (
+                            <div style={{ marginTop: '0.6rem', border: '1px solid rgba(96,165,250,0.25)', borderRadius: 8, background: 'rgba(96,165,250,0.05)', padding: '0.6rem' }}>
+                              <div style={{ color: '#c7d2dd', fontWeight: 600, marginBottom: '0.35rem' }}>Implementation contract</div>
+                              <div style={{ color: '#9aaeba', fontSize: '0.68rem', lineHeight: 1.5 }}>
+                                Scope: {selectedTask?.title || 'current task'}{selectedFile ? ` • file: ${selectedFile.name}` : ''}<br />
+                                Safety: require approval for destructive actions, validate changes, and keep the public contract stable.
+                              </div>
+                            </div>
+                          )}
+                          <div className="ed-sidebar-model-picker">
+                            <label>AI model</label>
+                            {renderAiModelSelector('is-sidebar-model', 'Choose an AI model')}
+                            {aiModelsError && <small role="status">{aiModelsError}</small>}
                           </div>
                         </div>
-                      )}
-                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: '0.6rem', gap: '0.5rem' }}>
-                        <button type="button" className="btn-workspace btn-secondary" style={{ flex: 1 }} onClick={() => setByomOpen((prev) => !prev)}>
-                          BYOM model
-                        </button>
-                        <span style={{ color: '#9aaeba', fontSize: '0.68rem' }}>{customModel}</span>
+
+                        {agentExecution && (
+                          <div className="ed-ai-intel" style={{ marginBottom: '0.75rem', borderColor: 'rgba(18,220,229,0.5)' }}>
+                            <div className="ed-ai-intel-header">
+                              <Bot className="w-4 h-4" style={{ color: '#12dce5' }} />
+                              <span>{agentExecution.title}</span>
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem', marginTop: '0.35rem', color: '#c7d2dd', fontSize: '0.7rem' }}>
+                              <span style={{ textTransform: 'capitalize' }}>{agentExecution.status}</span>
+                              <span style={{ color: '#56e5a9' }}>{agentExecution.diffSummary?.filesChanged || 0} files</span>
+                            </div>
+                            <div style={{ marginTop: '0.3rem', color: '#9aaeba', fontSize: '0.64rem', lineHeight: 1.5 }}>
+                              {agentExecution.goal || agentExecution.title}
+                            </div>
+                            <div style={{ marginTop: '0.5rem', display: 'flex', gap: '0.75rem', fontSize: '0.68rem', color: '#9aaeba' }}>
+                              <span>+{agentExecution.diffSummary?.insertions || 0}</span>
+                              <span>-{agentExecution.diffSummary?.deletions || 0}</span>
+                            </div>
+                            <div style={{ marginTop: '0.6rem', display: 'flex', flexDirection: 'column', gap: '0.35rem', fontSize: '0.68rem', color: '#c7d2dd' }}>
+                              {agentExecution.logs.slice(-4).map((log, idx) => (
+                                <div key={`${log}-${idx}`} style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)', borderRadius: 4, padding: '0.35rem 0.45rem' }}>
+                                  {log}
+                                </div>
+                              ))}
+                            </div>
+                            <div style={{ display: 'flex', gap: '0.4rem', marginTop: '0.65rem' }}>
+                              <button type="button" className="btn-workspace btn-primary" style={{ flex: 1, minHeight: 0, padding: '0.38rem 0.6rem' }} onClick={approveAgentExecution} disabled={agentExecution.status === 'completed' || agentExecution.status === 'rejected'}>
+                                {agentExecution.status === 'awaiting_approval' ? 'Approve' : 'Apply'}
+                              </button>
+                              <button type="button" className="btn-workspace btn-secondary" style={{ flex: 1, minHeight: 0, padding: '0.38rem 0.6rem' }} onClick={() => setTweaking((v) => !v)} disabled={agentExecution.status === 'completed' || agentExecution.status === 'rejected'}>
+                                Tweak
+                              </button>
+                              <button type="button" className="btn-workspace btn-secondary" style={{ flex: 1, minHeight: 0, padding: '0.38rem 0.6rem', color: '#ec8f8f' }} onClick={rejectAgentExecution} disabled={agentExecution.status === 'completed' || agentExecution.status === 'rejected'}>
+                                Reject
+                              </button>
+                            </div>
+                            {tweaking && agentExecution.status !== 'completed' && agentExecution.status !== 'rejected' && (
+                              <form
+                                style={{ display: 'flex', gap: '0.4rem', marginTop: '0.4rem' }}
+                                onSubmit={(e) => { e.preventDefault(); tweakAgentExecution(); }}
+                              >
+                                <input
+                                  type="text"
+                                  value={tweakFeedback}
+                                  onChange={(e) => setTweakFeedback(e.target.value)}
+                                  placeholder="What should the agent change?"
+                                  autoComplete="off"
+                                  style={{ flex: 1, minWidth: 0, padding: '0.35rem 0.5rem', borderRadius: 6, border: '1px solid rgba(255,255,255,0.12)', background: 'rgba(255,255,255,0.05)', color: '#ffffff', fontSize: '0.7rem', outline: 'none' }}
+                                />
+                                <button type="submit" className="btn-workspace btn-primary" style={{ padding: '0.35rem 0.7rem' }}>
+                                  Send
+                                </button>
+                              </form>
+                            )}
+                          </div>
+                        )}
+
+                        {aiMessages.length === 0 && (
+                          <div className="ed-ai-intel">
+                            <div className="ed-ai-intel-header">
+                              <Bot className="w-4 h-4" />
+                              <span>Product intelligence</span>
+                            </div>
+                            <div className="ed-ai-suggestions">
+                              {SMART_PROMPTS.map(({ label, hint, icon: Icon }) => (
+                                <button key={label} type="button" className="ed-ai-prompt" onClick={() => setAiInput(`${label} ${selectedFile ? `for ${selectedFile.name}` : ''}`)}>
+                                  <Icon className="w-3.5 h-3.5" />
+                                  <div>
+                                    <strong>{label}</strong>
+                                    <small>{hint}</small>
+                                  </div>
+                                </button>
+                              ))}
+                            </div>
+                            <button type="button" className="btn-workspace btn-primary" style={{ marginTop: '0.6rem' }} onClick={runSelectedTask}>
+                              Run agent task
+                            </button>
+                          </div>
+                        )}
+                        <div className="ed-chat">
+                          {aiMessages.length === 0 ? (
+                            <div className="ed-empty">
+                              <Bot className="w-6 h-6" />
+                              <p className="text-xs">Ask about your code, explore a design, or get structured implementation guidance.</p>
+                            </div>
+                          ) : aiMessages.map((m, i) => (
+                            m.role === 'user'
+                              ? <div key={i} className="ed-chat-bubble is-user">{m.content}</div>
+                              : renderStructuredAssistantMessage(m, i)
+                          ))}
+                          {aiLoading && <div className="ed-chat-gap" style={{ color: '#12dce5' }}>Thinking...</div>}
+                        </div>
+                        <form onSubmit={handleAiHelperSend} className="ed-composer">
+                          <input value={aiInput} onChange={(e) => setAiInput(e.target.value)} placeholder="Ask for an explanation or implementation guidance..." />
+                          <button type="submit" disabled={aiLoading || !aiInput.trim()} className="btn-workspace btn-primary" style={{ minHeight: 0, padding: '0.45rem 0.7rem' }}>
+                            <Bot className="w-4 h-4" />
+                          </button>
+                        </form>
                       </div>
-                      {byomOpen && (
-                        <div style={{ marginTop: '0.5rem', display: 'flex', gap: '0.4rem' }}>
+                    </>
+                  )}
+
+                  {activeSidebar === 'extensions' && (
+                    <>
+                      <div className="ed-sidebar-head">
+                        <span className="ed-sidebar-title">Extensions</span>
+                        <div className="ed-sidebar-actions"></div>
+                      </div>
+                      <div className="ed-sidebar-body">
+                        <div className="ed-stat">
+                          <span className="ed-badge-dot" style={{ background: blockCount ? '#e5b84a' : '#28c840' }} />
+                          Environment: <b>{subscription ? tierDisplayLabel(subscription) : tierDisplayLabel({ tier })}</b> · {extList.length}/{languages.length || '—'} languages active
+                        </div>
+                        <div className="ed-sidebar-title" style={{ padding: '0.1rem 0.55rem' }}>Productivity</div>
+                        {FEATURE_MODULES.map((m) => (
+                          <div key={m.id} className="ed-ext-item">
+                            <div className="ed-ext-ico"><m.icon className="w-4 h-4" /></div>
+                            <div style={{ minWidth: 0 }}>
+                              <div className="ed-ext-name">{m.name}</div>
+                              <div className="ed-ext-sub">{m.sub}</div>
+                            </div>
+                            <span className="pill pill-mono" style={{ marginLeft: 'auto', background: 'rgba(3,186,3,0.12)', color: '#56e5a9' }}>on</span>
+                          </div>
+                        ))}
+                        <div className="ed-sidebar-title" style={{ padding: '0.1rem 0.55rem' }}>Languages</div>
+                        {languages.length === 0 ? (
+                          <p className="text-xs" style={{ color: '#748194', padding: '0.2rem 0.55rem' }}>No language catalog yet</p>
+                        ) : (
+                          languages.map((l) => {
+                            const glyphColor = LANG_COLORS()[l.name] || '#9aaeba';
+                            const glyphText = (l.name || '').slice(0, 2).toUpperCase() || 'FILE';
+                            return (
+                              <div key={l.name} className="ed-ext-item" style={{ padding: '0.4rem 0.55rem' }}>
+                                <svg className="ed-file-glyph ed-file-glyph-sm" viewBox="0 0 24 24" aria-hidden="true">
+                                  <rect x="2" y="2" width="20" height="20" rx="5" fill={glyphColor} />
+                                  <text x="12" y="15.5" textAnchor="middle" fontSize="7" fontWeight="700" fill="#0b1020" fontFamily="ui-sans-serif, system-ui, sans-serif">{glyphText}</text>
+                                </svg>
+                                <div>
+                                  <div className="ed-ext-name" style={{ fontSize: '0.74rem' }}>{l.name}</div>
+                                </div>
+                                <span className={`pill pill-mono ${l.allowed === false ? 'is-free' : ''}`} style={{ marginLeft: 'auto', ...(l.allowed === false ? { background: 'rgba(236,20,20,0.12)', color: '#ec1414' } : { background: 'rgba(3,186,3,0.12)', color: '#56e5a9' }) }}>
+                                  {l.allowed === false ? 'locked' : 'active'}
+                                </span>
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+                    </>
+                  )}
+                </aside>
+              )}
+
+              {/* ---- Editor group ---- */}
+              <div className={`ed-main ${projectPickerOpen ? 'is-project-picker' : !selectedFile ? 'is-welcome' : ''}`}>
+                {projectPickerOpen ? (
+                  <div className="ed-project-picker">
+                    <header className="ed-project-picker-heading">
+                      <div className="ed-project-picker-title">
+                        <button type="button" onClick={() => setProjectPickerOpen(false)} aria-label="Back to editor">
+                          <ArrowLeft className="w-5 h-5" />
+                        </button>
+                        <div>
+                          <h1>My Projects</h1>
+                          <p>Choose a project to load its files and workspace</p>
+                        </div>
+                      </div>
+                      <div className="ed-project-picker-actions">
+                        <button type="button" onClick={() => router.push({ pathname: '/projects', query: { createSource: 'github' } })}>Import GitHub</button>
+                        <button type="button" className="is-primary" onClick={() => router.push({ pathname: '/projects', query: { createSource: 'scratch' } })}>Create New Project</button>
+                      </div>
+                    </header>
+
+                    <section className="ed-project-list-panel" aria-label="Recent projects">
+                      <div className="ed-project-list-heading">
+                        <h2>Recent projects</h2>
+                        <label className="ed-project-search">
+                          <Search className="w-3.5 h-3.5" aria-hidden="true" />
                           <input
-                            value={customModel}
-                            onChange={(e) => setCustomModel(e.target.value)}
-                            className="ws-input"
-                            style={{ flex: 1 }}
-                            placeholder="model name"
+                            type="search"
+                            value={projectSearch}
+                            onChange={(event) => setProjectSearch(event.target.value)}
+                            placeholder="Search Project"
+                            aria-label="Search projects"
+                          />
+                        </label>
+                      </div>
+
+                      {projectsError ? (
+                        <div className="ed-project-list-message" role="alert">
+                          <span>{projectsError}</span>
+                          <button type="button" onClick={loadProjects} disabled={projectsLoading}>
+                            {projectsLoading ? 'Loading...' : 'Try again'}
+                          </button>
+                        </div>
+                      ) : projectsLoading ? (
+                        <div className="ed-project-list-message" role="status">
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          Loading projects...
+                        </div>
+                      ) : filteredProjects.length ? (
+                        <div className="ed-project-choices">
+                          {filteredProjects.map((project) => {
+                            const projectId = String(project._id || project.id);
+                            const technologies = Array.isArray(project.technologies) && project.technologies.length
+                              ? project.technologies
+                              : (Array.isArray(project.tags) ? project.tags : []);
+                            const repository = project.githubRepoName
+                              || project.repositoryFullName
+                              || project.repository?.fullName
+                              || (typeof project.repository === 'string' ? project.repository : project.name);
+                            const isCurrentProject = projectId === String(selectedProject?._id || selectedProject?.id || '');
+                            const edited = formatEditorRelativeTime(project.updatedAt);
+                            return (
+                              <button
+                                key={projectId}
+                                type="button"
+                                className={`ed-project-choice ${isCurrentProject ? 'is-selected' : ''}`}
+                                onClick={() => selectProjectForEditor(project)}
+                                aria-label={`Open ${project.name} in the editor`}
+                                aria-pressed={isCurrentProject}
+                              >
+                                <span className="ed-project-choice-copy">
+                                  <strong>{project.name}</strong>
+                                  <span className="ed-project-choice-meta">
+                                    {repository}{technologies.length ? ` · ${technologies.join(' · ')}` : ''}
+                                  </span>
+                                  <small>{project.defaultBranch || 'main'}{edited ? ` · Edited ${edited}` : ''}</small>
+                                </span>
+                                <span className="ed-project-choice-radio" aria-hidden="true" />
+                              </button>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <div className="ed-project-list-message">
+                          {projectSearch.trim() ? 'No projects match your search.' : 'No projects yet. Create a new project to get started.'}
+                        </div>
+                      )}
+                    </section>
+                  </div>
+                ) : (
+                  <>
+                    <div className="ed-tabsbar">
+                      {!selectedFile && <div className="ed-welcome-tab">Welcome</div>}
+                      {openFiles.map((f) => {
+                        const fileKey = getFileKey(f);
+                        const isActive = getFileKey(selectedFile) === fileKey;
+                        const fDirty = isDirtyKey(fileKey);
+                        return (
+                          <div key={fileKey} className={`ed-tabhead ${isActive ? 'is-active' : ''}`} onClick={() => selectFile(f)} role="button">
+                            {getLanguageGlyph(f.name)}
+                            <span className="ed-tabname">{f.name}</span>
+                            {fDirty ? <span className="ed-tabdirty" /> : null}
+                            <button type="button" className="ed-tabclose" onClick={(e) => closeTab(f, e)} title="Close (⌘W)">
+                              <X className="w-3 h-3" />
+                            </button>
+                          </div>
+                        );
+                      })}
+                      <div className="ed-tabsbar-right">
+                        {selectedFile && (
+                          <>
+                            <button type="button" className="btn-workspace btn-secondary" onClick={() => handleDelete(selectedFile)} title="Delete file" style={{ color: '#ec1414' }}>
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                            <button type="button" className="btn-workspace btn-primary" onClick={handleSave} disabled={saving || !dirty}>
+                              <Save className="w-3.5 h-3.5" />{saving ? 'Saving...' : 'Save'}
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="ed-breadcrumb">
+                      {selectedFile ? (
+                        <div className="ed-breadcrumb-path">
+                          <FolderOpen className="w-3 h-3" style={{ color: '#12dce5' }} />
+                          <span>{selectedProject ? selectedProject.name : selectedRepo ? (selectedRepo.fullName || selectedRepo.name) : 'workspace'}</span>
+                          {filePathSegs.map((seg, i) => (
+                            <span key={`${seg}-${i}`} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+                              <span className="ed-breadcrumb-sep">›</span>
+                              <span style={i === filePathSegs.length - 1 ? { color: '#c7d2dd' } : undefined}>{seg}</span>
+                            </span>
+                          ))}
+                        </div>
+                      ) : (
+                        <span style={{ color: '#748194' }}>No file open — select a file from the Explorer</span>
+                      )}
+                      {selectedFile && (
+                        <div className="ed-editor-actions">
+                          <button
+                            type="button"
+                            className={`ed-run-test-button ${running ? 'is-running' : ''}`}
+                            onClick={handleRun}
+                            title={running ? 'Stop run' : 'Run test'}
+                            aria-live="polite"
+                          >
+                            {running ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
+                            {running ? 'Running…' : 'Run Test'}
+                          </button>
+                          <button
+                            type="button"
+                            className="ed-preview-button"
+                            onClick={() => sandboxUrl
+                              ? openPreviewInNewTab(sandboxUrl)
+                              : handleProjectPreview()}
+                            disabled={previewState === 'starting'}
+                            title={sandboxUrl ? 'Open project preview in a new tab' : 'Preview project'}
+                          >
+                            {previewState === 'starting'
+                              ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              : <Eye className="w-3.5 h-3.5" />}
+                            {previewState === 'starting' ? 'Starting…' : sandboxUrl ? 'Open Preview' : 'Preview'}
+                          </button>
+                          <button
+                            type="button"
+                            className={`ed-assistant-toggle ${assistantDockOpen ? 'is-active' : ''}`}
+                            onClick={() => {
+                              const opening = !assistantDockOpen;
+                              setAssistantDockOpen(opening);
+                              if (opening && !aiModelsLoaded && !aiModelsLoading) loadAiModels();
+                            }}
+                            aria-label={assistantDockOpen ? 'Close AI assistant' : 'Open AI assistant'}
+                            aria-pressed={assistantDockOpen}
+                            title="AI Assistant"
+                          >
+                            <Sparkles className="w-4 h-4" />
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="ed-editor">
+                      {status && (
+                        <div className={`ed-alert ${status.type === 'success' ? 'ed-alert-success' : 'ed-alert-error'}`}>
+                          {status.type === 'success' ? <CheckCircle className="w-4 h-4" /> : <XCircle className="w-4 h-4" />}
+                          {status.msg}
+                        </div>
+                      )}
+                      {!selectedFile ? (
+                        <div className="ed-editor-welcome">
+                          <div className="ed-editor-welcome-icon" aria-hidden="true">&lt;/&gt;</div>
+                          <h1>Your next build starts here</h1>
+                          <p>
+                            Open an existing project or create a new file.
+                            <br />
+                            Your workspace will be ready when you are.
+                          </p>
+                          <div className="ed-editor-welcome-actions">
+                            <button type="button" className="is-primary" onClick={openProjectPicker}>Add Project</button>
+                            <button type="button" onClick={() => startInlineCreate()}>Create new file</button>
+                          </div>
+                          <button type="button" className="ed-editor-welcome-link" onClick={() => router.push({ pathname: '/projects', query: { createSource: 'github' } })}>
+                            Import from GitHub
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="ed-code-wrap">
+                          {fileLoading && (
+                            <div className="ed-file-loading" role="status">
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                              Loading file…
+                            </div>
+                          )}
+                          <MonacoEditor
+                            height="100%"
+                            language={monacoLanguage}
+                            value={content}
+                            onChange={handleEditorChange}
+                            onMount={handleEditorMount}
+                            beforeMount={handleEditorWillMount}
+                            theme="buildrs-figma"
+                            options={monacoOptions}
+                            loading={<div className="ed-ide-empty">Loading editor...</div>}
                           />
                         </div>
                       )}
                     </div>
 
-                    {agentExecution && (
-                      <div className="ed-ai-intel" style={{ marginBottom: '0.75rem', borderColor: 'rgba(18,220,229,0.5)' }}>
-                        <div className="ed-ai-intel-header">
-                          <Bot className="w-4 h-4" style={{ color: '#12dce5' }} />
-                          <span>{agentExecution.title}</span>
-                        </div>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem', marginTop: '0.35rem', color: '#c7d2dd', fontSize: '0.7rem' }}>
-                          <span style={{ textTransform: 'capitalize' }}>{agentExecution.status}</span>
-                          <span style={{ color: '#56e5a9' }}>{agentExecution.diffSummary?.filesChanged || 0} files</span>
-                        </div>
-                        <div style={{ marginTop: '0.3rem', color: '#9aaeba', fontSize: '0.64rem', lineHeight: 1.5 }}>
-                          {agentExecution.goal || agentExecution.title}
-                        </div>
-                        <div style={{ marginTop: '0.5rem', display: 'flex', gap: '0.75rem', fontSize: '0.68rem', color: '#9aaeba' }}>
-                          <span>+{agentExecution.diffSummary?.insertions || 0}</span>
-                          <span>-{agentExecution.diffSummary?.deletions || 0}</span>
-                        </div>
-                        <div style={{ marginTop: '0.6rem', display: 'flex', flexDirection: 'column', gap: '0.35rem', fontSize: '0.68rem', color: '#c7d2dd' }}>
-                          {agentExecution.logs.slice(-4).map((log, idx) => (
-                            <div key={`${log}-${idx}`} style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.04)', borderRadius: 4, padding: '0.35rem 0.45rem' }}>
-                              {log}
-                            </div>
-                          ))}
-                        </div>
-                        <div style={{ display: 'flex', gap: '0.4rem', marginTop: '0.65rem' }}>
-                          <button type="button" className="btn-workspace btn-primary" style={{ flex: 1, minHeight: 0, padding: '0.38rem 0.6rem' }} onClick={approveAgentExecution} disabled={agentExecution.status === 'completed' || agentExecution.status === 'rejected'}>
-                            {agentExecution.status === 'awaiting_approval' ? 'Approve' : 'Apply'}
-                          </button>
-                          <button type="button" className="btn-workspace btn-secondary" style={{ flex: 1, minHeight: 0, padding: '0.38rem 0.6rem' }} onClick={() => setTweaking((v) => !v)} disabled={agentExecution.status === 'completed' || agentExecution.status === 'rejected'}>
-                            Tweak
-                          </button>
-                          <button type="button" className="btn-workspace btn-secondary" style={{ flex: 1, minHeight: 0, padding: '0.38rem 0.6rem', color: '#ec8f8f' }} onClick={rejectAgentExecution} disabled={agentExecution.status === 'completed' || agentExecution.status === 'rejected'}>
-                            Reject
-                          </button>
-                        </div>
-                        {tweaking && agentExecution.status !== 'completed' && agentExecution.status !== 'rejected' && (
-                          <form
-                            style={{ display: 'flex', gap: '0.4rem', marginTop: '0.4rem' }}
-                            onSubmit={(e) => { e.preventDefault(); tweakAgentExecution(); }}
-                          >
-                            <input
-                              type="text"
-                              value={tweakFeedback}
-                              onChange={(e) => setTweakFeedback(e.target.value)}
-                              placeholder="What should the agent change?"
-                              autoComplete="off"
-                              style={{ flex: 1, minWidth: 0, padding: '0.35rem 0.5rem', borderRadius: 6, border: '1px solid rgba(255,255,255,0.12)', background: 'rgba(255,255,255,0.05)', color: '#ffffff', fontSize: '0.7rem', outline: 'none' }}
-                            />
-                            <button type="submit" className="btn-workspace btn-primary" style={{ padding: '0.35rem 0.7rem' }}>
-                              Send
-                            </button>
-                          </form>
-                        )}
-                      </div>
-                    )}
-
-                    {aiMessages.length === 0 && (
-                      <div className="ed-ai-intel">
-                        <div className="ed-ai-intel-header">
-                          <Bot className="w-4 h-4" />
-                          <span>Product intelligence</span>
-                        </div>
-                        <div className="ed-ai-suggestions">
-                          {SMART_PROMPTS.map(({ label, hint, icon: Icon }) => (
-                            <button key={label} type="button" className="ed-ai-prompt" onClick={() => setAiInput(`${label} ${selectedFile ? `for ${selectedFile.name}` : ''}`)}>
-                              <Icon className="w-3.5 h-3.5" />
-                              <div>
-                                <strong>{label}</strong>
-                                <small>{hint}</small>
-                              </div>
+                    {/* ---- Bottom panel ---- */}
+                    {panel && selectedFile && (
+                      <div className={`ed-panel ${panel === 'problems' ? 'is-problems' : ''}`}>
+                        <div className="ed-panelbar">
+                          {[
+                            { id: 'terminal', label: 'Terminal', icon: Terminal },
+                            { id: 'problems', label: 'Problems', icon: AlertCircle },
+                            { id: 'tests', label: 'Tests', icon: CheckCircle },
+                          ].map((t) => (
+                            <button
+                              key={t.id}
+                              type="button"
+                              className={`ed-panel-tab ${panel === t.id ? 'is-active' : ''}`}
+                              onClick={() => setPanel(t.id)}
+                              aria-label={t.id === 'problems'
+                                ? `${t.label}: ${problemCounts.error} errors, ${problemCounts.warning} warnings, ${problemCounts.info} informational`
+                                : t.label}
+                            >
+                              <t.icon className="w-3.5 h-3.5" /> {t.label}
                             </button>
                           ))}
-                        </div>
-                        <button type="button" className="btn-workspace btn-primary" style={{ marginTop: '0.6rem' }} onClick={runSelectedTask}>
-                          Run agent task
-                        </button>
-                      </div>
-                    )}
-                    <div className="ed-chat">
-                      {aiMessages.length === 0 ? (
-                        <div className="ed-empty">
-                          <Bot className="w-6 h-6" />
-                          <p className="text-xs">Ask about your code, get completions, or request refactors.</p>
-                        </div>
-                      ) : aiMessages.map((m, i) => (
-                        <div key={i} className={`ed-chat-bubble ${m.role === 'user' ? 'is-user' : 'is-ai'}`}>
-                          {m.content}
-                        </div>
-                      ))}
-                      {aiLoading && <div className="ed-chat-gap" style={{ color: '#12dce5' }}>Thinking...</div>}
-                    </div>
-                    <form onSubmit={handleAiHelperSend} className="ed-composer">
-                      <input value={aiInput} onChange={(e) => setAiInput(e.target.value)} placeholder="Ask AI to explain or refactor..." />
-                      <button type="submit" disabled={aiLoading || !aiInput.trim()} className="btn-workspace btn-primary" style={{ minHeight: 0, padding: '0.45rem 0.7rem' }}>
-                        <Bot className="w-4 h-4" />
-                      </button>
-                    </form>
-                  </div>
-                </>
-              )}
-
-              {activeSidebar === 'extensions' && (
-                <>
-                  <div className="ed-sidebar-head">
-                    <span className="ed-sidebar-title">Extensions</span>
-                    <div className="ed-sidebar-actions"></div>
-                  </div>
-                  <div className="ed-sidebar-body">
-                    <div className="ed-stat">
-                      <span className="ed-badge-dot" style={{ background: blockCount ? '#e5b84a' : '#28c840' }} />
-                      Environment: <b>{subscription ? tierDisplayLabel(subscription) : tierDisplayLabel({ tier })}</b> · {extList.length}/{languages.length || '—'} languages active
-                    </div>
-                    <div className="ed-sidebar-title" style={{ padding: '0.1rem 0.55rem' }}>Productivity</div>
-                    {FEATURE_MODULES.map((m) => (
-                      <div key={m.id} className="ed-ext-item">
-                        <div className="ed-ext-ico"><m.icon className="w-4 h-4" /></div>
-                        <div style={{ minWidth: 0 }}>
-                          <div className="ed-ext-name">{m.name}</div>
-                          <div className="ed-ext-sub">{m.sub}</div>
-                        </div>
-                        <span className="pill pill-mono" style={{ marginLeft: 'auto', background: 'rgba(3,186,3,0.12)', color: '#56e5a9' }}>on</span>
-                      </div>
-                    ))}
-                    <div className="ed-sidebar-title" style={{ padding: '0.1rem 0.55rem' }}>Languages</div>
-                    {languages.length === 0 ? (
-                      <p className="text-xs" style={{ color: '#748194', padding: '0.2rem 0.55rem' }}>No language catalog yet</p>
-                    ) : (
-                      languages.map((l) => {
-                        const glyphColor = LANG_COLORS()[l.name] || '#9aaeba';
-                        const glyphText = (l.name || '').slice(0, 2).toUpperCase() || 'FILE';
-                        return (
-                          <div key={l.name} className="ed-ext-item" style={{ padding: '0.4rem 0.55rem' }}>
-                            <svg className="ed-file-glyph ed-file-glyph-sm" viewBox="0 0 24 24" aria-hidden="true">
-                              <rect x="2" y="2" width="20" height="20" rx="5" fill={glyphColor} />
-                              <text x="12" y="15.5" textAnchor="middle" fontSize="7" fontWeight="700" fill="#0b1020" fontFamily="ui-sans-serif, system-ui, sans-serif">{glyphText}</text>
-                            </svg>
-                            <div>
-                              <div className="ed-ext-name" style={{ fontSize: '0.74rem' }}>{l.name}</div>
-                            </div>
-                            <span className={`pill pill-mono ${l.allowed === false ? 'is-free' : ''}`} style={{ marginLeft: 'auto', ...(l.allowed === false ? { background: 'rgba(236,20,20,0.12)', color: '#ec1414' } : { background: 'rgba(3,186,3,0.12)', color: '#56e5a9' }) }}>
-                              {l.allowed === false ? 'locked' : 'active'}
-                            </span>
+                          <div className="ed-panel-actions">
+                            {panel === 'tests' && outputLines.length > 0 && (
+                              <button type="button" className="ed-panel-close" onClick={copyOutput} title="Copy output">
+                                <Copy className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                            {panel === 'tests' && outputLines.length > 0 && (
+                              <button type="button" className="ed-panel-close" onClick={clearOutput} title="Clear output">
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                            <button type="button" className="ed-panel-close" onClick={() => setPanel(null)} title="Close panel"><X className="w-4 h-4" /></button>
                           </div>
-                        );
-                      })
-                    )}
-                  </div>
-                </>
-              )}
-            </aside>
-          )}
+                        </div>
 
-          {/* ---- Editor group ---- */}
-          <div className="ed-main">
-            <div className="ed-tabsbar">
-              {openFiles.map((f) => {
-                const fileKey = getFileKey(f);
-                const isActive = getFileKey(selectedFile) === fileKey;
-                const fDirty = isDirtyKey(fileKey);
-                return (
-                  <div key={fileKey} className={`ed-tabhead ${isActive ? 'is-active' : ''}`} onClick={() => selectFile(f)} role="button">
-                    {getLanguageGlyph(f.name)}
-                    <span className="ed-tabname">{f.name}</span>
-                    {fDirty ? <span className="ed-tabdirty" /> : null}
-                    <button type="button" className="ed-tabclose" onClick={(e) => closeTab(f, e)} title="Close (⌘W)">
-                      <X className="w-3 h-3" />
-                    </button>
-                  </div>
-                );
-              })}
-              <div className="ed-tabsbar-right">
-                {selectedFile && (
-                  <>
-                    <button
-                      type="button"
-                      className="btn-workspace btn-primary"
-                      onClick={handleRun}
-                      title={running ? 'Stop run' : 'Run file (⌘R)'}
-                      style={{ background: running ? '#b45309' : '#16a34a', color: '#fff' }}
-                    >
-                      {running ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
-                      {running ? 'Stop' : 'Run'}
-                    </button>
-                    <button type="button" className="btn-workspace btn-secondary" onClick={() => handleDelete(selectedFile)} title="Delete file" style={{ color: '#ec1414' }}>
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                    <button type="button" className="btn-workspace btn-primary" onClick={handleSave} disabled={saving || !dirty}>
-                      <Save className="w-3.5 h-3.5" />{saving ? 'Saving...' : 'Save'}
-                    </button>
+                        <div className="ed-panel-body">
+                          {panel === 'tests' && outputLines.length > 0 && (
+                            <div className={`ed-run-summary ${running ? 'is-running' : `is-${runOutcome}`}`}>
+                              <div className="ed-run-summary-top">
+                                <div className="ed-run-summary-title">
+                                  <span className="ed-run-summary-status">{running ? 'RUNNING' : runOutcome.toUpperCase()}</span>
+                                  <strong>{running ? `Running ${selectedFile?.path || selectedFile?.name || 'file'}` : `Run ${runOutcome}`}</strong>
+                                </div>
+                                <div className="ed-run-summary-meta">
+                                  <span>Elapsed {(runElapsedMs / 1000).toFixed(1)}s</span>
+                                  {running && (
+                                    <button type="button" className="ed-run-stop-button" onClick={stopRun}>
+                                      Stop Run
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                              {running && (
+                                <div className="ed-run-progress" role="progressbar" aria-label="Run in progress">
+                                  <span />
+                                </div>
+                              )}
+                            </div>
+                          )}
+                          {panel === 'terminal' && (
+                            <div className="ed-term-shell">
+                              <div className="ed-term-toolbar">
+                                <div className="ed-term-meta">
+                                  <span className={`ed-term-capsule ${termInfo ? 'is-live' : ''}`}>{termInfo ? 'LIVE' : 'CONNECTING'}</span>
+                                  <span className="ed-term-label">
+                                    {termInfo ? (termInfo.type === 'pty' ? 'Workspace Shell · PTY' : 'Workspace Shell · simulated') : 'Workspace Shell'}
+                                    {(selectedRepo || selectedProject) && (
+                                      <span className="ed-term-scope">
+                                        {' — '}
+                                        {selectedRepo
+                                          ? (selectedRepo.fullName || selectedRepo.name)
+                                          : selectedProject?.name}
+                                      </span>
+                                    )}
+                                  </span>
+                                </div>
+                                <div className="ed-term-actions">
+                                  <span className="ed-term-pill">{termInfo?.type === 'simulated' ? 'Bash (sim)' : 'Bash'}</span>
+                                  {termInfo?.sessionId && <span className="ed-term-pill">{String(termInfo.sessionId).slice(-10)}</span>}
+                                </div>
+                              </div>
+                              <div ref={terminalRef} className="ed-term-root" />
+                            </div>
+                          )}
+
+                          {panel === 'problems' && (
+                            <>
+                              <div className="ed-problems-list">
+                                {allProblems.length > 0 ? allProblems.map((p, i) => {
+                                  const severity = ['error', 'warning'].includes(String(p.severity).toLowerCase())
+                                    ? String(p.severity).toLowerCase()
+                                    : 'info';
+                                  const file = p.file || selectedFile?.path || selectedFile?.name || '';
+                                  return (
+                                    <button
+                                      key={`${p.file || ''}:${p.line || 0}:${p.column || 0}:${i}`}
+                                      type="button"
+                                      className={`ed-problem-row is-${severity}`}
+                                      onClick={() => {
+                                        if (p.line) jumpToProblem(p);
+                                      }}
+                                      title={p.message}
+                                    >
+                                      <span className="ed-problem-severity">{severity}</span>
+                                      <span className="ed-problem-message">{p.message}</span>
+                                      <span className="ed-problem-location">{file ? `${file}:${p.line || 1}` : `Ln ${p.line || 1}`}</span>
+                                    </button>
+                                  );
+                                }) : (
+                                  <div className="ed-problems-empty">No problems detected.</div>
+                                )}
+                              </div>
+                              {blockCount > 0 && (
+                                <div className="ed-problems-notice">
+                                  {blockCount} language(s) unavailable on your current tier — upgrade to unlock {blockCount === 1 ? 'it' : 'them'}.
+                                </div>
+                              )}
+                            </>
+                          )}
+
+                          {panel === 'tests' && (
+                            <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, flex: 1, fontFamily: 'var(--figma-font-mono)', fontSize: '0.72rem' }}>
+                              {outputLines.length === 0 ? (
+                                <div className="ed-empty" style={{ flex: 1 }}>
+                                  <Play className="w-6 h-6" />
+                                  <p className="text-xs">Run a file to see its output and results here</p>
+                                </div>
+                              ) : (
+                                <div style={{ overflowY: 'auto', minHeight: 0, flex: 1, padding: '0.35rem 0.6rem' }}>
+                                  {outputLines.map((l, i) => {
+                                    const segs = ansiSegments(l.text);
+                                    return (
+                                      <div
+                                        key={i}
+                                        style={{
+                                          whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.5,
+                                          color: l.kind === 'err' ? '#ec1414' : l.kind === 'sys' ? '#56e5a9' : '#c7d2dd',
+                                        }}
+                                      >
+                                        {segs.length === 0 ? ' ' : segs.map((seg, j) => (
+                                          <span
+                                            key={j}
+                                            style={{
+                                              ...(seg.fg ? { color: seg.fg } : null),
+                                              ...(seg.bg ? { backgroundColor: seg.bg } : null),
+                                              ...(seg.bold ? { fontWeight: 700 } : null),
+                                              ...(seg.dim ? { opacity: 0.65 } : null),
+                                              ...(seg.underline ? { textDecoration: 'underline' } : null),
+                                            }}
+                                          >
+                                            {seg.text}
+                                          </span>
+                                        ))}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {panel === 'preview' && (
+                            <>
+                              <div className="ed-intel-grid">
+                                <div className="ed-intel-card">
+                                  <span className="ed-intel-label">Preview</span>
+                                  <strong>{previewState === 'starting' ? 'Starting' : sandboxUrl ? 'Live' : previewState === 'error' ? 'Error' : 'Idle'}</strong>
+                                  <small>{sandboxUrl ? 'Project preview is running' : 'Start a preview to view your project'}</small>
+                                </div>
+                                <div className="ed-intel-card">
+                                  <span className="ed-intel-label">Design</span>
+                                  <strong>{selectedFigmaFile ? 'Connected' : 'Not linked'}</strong>
+                                  <small>{selectedFigmaFile ? selectedFigmaFile.name || 'Selected design' : 'Connect a Figma file to generate code'}</small>
+                                </div>
+                                <div className="ed-intel-card">
+                                  <span className="ed-intel-label">Active file</span>
+                                  <strong>{selectedFile ? selectedFile.name : 'No file'}</strong>
+                                  <small>{selectedFile ? `${selectedFile.language || detectLanguage(selectedFile.name)} source` : 'Open a file to preview it'}</small>
+                                </div>
+                              </div>
+                              {!sandboxUrl && (
+                                <div className="ed-preview-prompt">
+                                  <div>
+                                    <strong>{previewState === 'starting' ? previewStage || 'Preparing your project…' : 'Preview this project'}</strong>
+                                    <p>
+                                      Static HTML/CSS opens in a secure preview. Apps with a package.json dev or start script run in a browser container.
+                                    </p>
+                                  </div>
+                                  {previewState === 'starting' ? (
+                                    <button type="button" className="ed-preview-stop-button" onClick={handlePreviewStop}>
+                                      Cancel
+                                    </button>
+                                  ) : (
+                                    <button type="button" className="ed-preview-start-button" onClick={() => handleProjectPreview()}>
+                                      <Eye className="w-3.5 h-3.5" /> {previewState === 'error' ? 'Retry Preview' : 'Start Preview'}
+                                    </button>
+                                  )}
+                                  {previewError && <p className="ed-preview-error" role="alert">{previewError}</p>}
+                                  {previewLogs.length > 0 && (
+                                    <pre className="ed-preview-logs" aria-label="Project preview output">
+                                      {previewLogs.join('')}
+                                    </pre>
+                                  )}
+                                </div>
+                              )}
+                              {sandboxUrl ? (
+                                <>
+                                  {previewState === 'running' && (
+                                    <div className="ed-preview-livebar">
+                                      <span>Live project preview</span>
+                                      <button type="button" onClick={() => openPreviewInNewTab(sandboxUrl)}>Open in New Tab</button>
+                                      <button type="button" onClick={() => handleProjectPreview(undefined, { openInNewTab: false })}>Refresh</button>
+                                      <button type="button" onClick={handlePreviewStop}>Stop Preview</button>
+                                    </div>
+                                  )}
+                                  <iframe src={sandboxUrl} className="w-full flex-1" style={{ background: '#ffffff', border: 'none', borderRadius: '6px', minHeight: 0 }} title="Live project preview" />
+                                </>
+                              ) : (
+                                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem', minHeight: 0, flex: 1 }}>
+                                  <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                                    <span className="ed-sidebar-title">Figma Design</span>
+                                    {!selectedFigmaFile ? (
+                                      figmaFiles.length === 0 ? (
+                                        <div className="ed-stat" style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '0.6rem' }}>
+                                          <Layers className="w-6 h-6" style={{ color: '#748194' }} />
+                                          <span>No Figma files added yet</span>
+                                          <a href="/figma" className="btn-workspace btn-secondary">Add Figma file</a>
+                                        </div>
+                                      ) : (
+                                        <div style={{ overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.2rem' }}>
+                                          {figmaFiles.map((f) => (
+                                            <button key={f.key || f.id} type="button" className="ed-drop-item" onClick={() => setSelectedFigmaFile(f)}>
+                                              <Layers className="w-3.5 h-3.5" />
+                                              <span style={{ minWidth: 0 }}>
+                                                <span className="block truncate text-xs">{f.name || f.key}</span>
+                                                <span className="block text-xs" style={{ color: '#748194' }}>{f.last_modified ? new Date(f.last_modified).toLocaleDateString() : ''}</span>
+                                              </span>
+                                            </button>
+                                          ))}
+                                        </div>
+                                      )
+                                    ) : (
+                                      <div className="ed-design-pane" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                                        <div className="ed-stat" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.4rem' }}>
+                                          <button type="button" onClick={() => setSelectedFigmaFile(null)} style={{ color: '#12dce5', background: 'none', border: 'none', cursor: 'pointer', fontSize: '0.66rem' }}>← All files</button>
+                                          <span className="truncate" style={{ color: '#c7d2dd' }}>{selectedFigmaFile.name || selectedFigmaFile.key}</span>
+                                        </div>
+                                        <div style={{ flex: 1, minHeight: 0, overflow: 'auto', background: '#0a0d15', border: '1px solid rgba(255,255,255,0.09)', borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                                          {selectedFigmaFile.thumbnail_url ? (
+                                            <img src={selectedFigmaFile.thumbnail_url} alt={selectedFigmaFile.name || 'design'} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
+                                          ) : (
+                                            <Layers className="w-8 h-8" style={{ color: '#2a3446' }} />
+                                          )}
+                                        </div>
+                                        <button type="button" className="btn-workspace btn-primary" onClick={generateFromDesign}>
+                                          <Bot className="w-3.5 h-3.5" /> Generate React code
+                                        </button>
+                                      </div>
+                                    )}
+                                  </div>
+                                  <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                                    <span className="ed-sidebar-title">Code</span>
+                                    <div className="ed-code-wrap">
+                                      {selectedFile ? (
+                                        <MonacoEditor height="100%" language={monacoLanguage} value={content} onChange={handleEditorChange} theme="buildrs-figma"
+                                          beforeMount={handleEditorWillMount}
+                                          options={monacoPreviewOptions} />
+                                      ) : (
+                                        <div className="ed-ide-empty">Select a file to preview</div>
+                                      )}
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
+                            </>
+                          )}
+
+                          {panel === 'deploy' && (
+                            <>
+                              <div className="ed-intel-grid">
+                                <div className="ed-intel-card">
+                                  <span className="ed-intel-label">Deploys</span>
+                                  <strong>{deployments.length}</strong>
+                                  <small>Current deployment records</small>
+                                </div>
+                                <div className="ed-intel-card">
+                                  <span className="ed-intel-label">Environment</span>
+                                  <strong>{subscription ? tierDisplayLabel(subscription) : tierBadgeLabel(subscription?.tier)}</strong>
+                                  <small>{blockCount ? `${blockCount} language(s) locked` : 'Full toolchain enabled'}</small>
+                                </div>
+                                <div className="ed-intel-card">
+                                  <span className="ed-intel-label">Workspace</span>
+                                  <strong>{selectedProject ? selectedProject.name : 'Default'}</strong>
+                                  <small>{workspaceId ? 'Linked and ready to ship' : 'Add a workspace to deploy'}</small>
+                                </div>
+                              </div>
+                              <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                                <button type="button" className="btn-workspace btn-primary" onClick={handleDeploy}>
+                                  <Rocket className="w-4 h-4" /> New Deployment
+                                </button>
+                                <button type="button" className="btn-workspace btn-secondary" onClick={() => loadDeployments({ forceRefresh: true })}>
+                                  <RefreshCw className="w-3.5 h-3.5" /> Refresh
+                                </button>
+                                {deployScopeId && (
+                                  <button
+                                    type="button"
+                                    className="btn-workspace btn-secondary"
+                                    onClick={() => setAutoDeploy(!autoDeployOn)}
+                                    title={autoDeployOn ? 'Auto-deploy is ON: saving republishes this workspace' : 'Auto-deploy is OFF: save without republishing'}
+                                    aria-pressed={autoDeployOn}
+                                  >
+                                    Auto-Deploy
+                                    <span className={`mkt-mono`} style={{ fontSize: '10px', marginLeft: '6px', padding: '1px 7px', borderRadius: 999, background: autoDeployOn ? 'rgba(3,186,3,0.15)' : 'rgba(255,255,255,0.08)', color: autoDeployOn ? '#03ba03' : '#9aaeba' }}>
+                                      {autoDeployOn ? 'ON' : 'OFF'}
+                                    </span>
+                                  </button>
+                                )}
+                                <span className="text-xs" style={{ color: '#748194' }}>One-click static deploy → .buildrshq.dev</span>
+                              </div>
+
+                              {showSubdomainInput && (
+                                <form onSubmit={confirmDeploy} className="ed-stat" style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+                                  <label className="ws-label" style={{ color: '#9aaeba' }}>Choose a subdomain</label>
+                                  {(() => {
+                                    const secretFiles = gatherDeploymentFiles().filter((f) =>
+                                      isPrivateFile(f));
+                                    return secretFiles.length > 0 ? (
+                                      <p className="text-xs" style={{ color: '#e5b84a' }}>
+                                        Includes {secretFiles.length} secret file{secretFiles.length === 1 ? '' : 's'}
+                                        {secretFiles[0]?.name ? ` (${secretFiles.slice(0, 3).map((f) => f.name).join(', ')})` : ''} — values ship with this deploy.
+                                      </p>
+                                    ) : null;
+                                  })()}                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                                    <input type="text" value={deploySubdomain} onChange={(e) => setDeploySubdomain(e.target.value.replace(/[^a-z0-9-]/g, '-').toLowerCase())}
+                                      placeholder="my-app" className="ws-input"
+                                      style={{ fontFamily: 'var(--figma-font-mono)', background: '#0a0d15', borderColor: '#2a3446' }}
+                                      autoFocus required minLength={2} />
+                                    <span className="text-sm whitespace-nowrap" style={{ color: '#748194' }}>.buildrshq.dev</span>
+                                    <button type="submit" disabled={deploying || deploySubdomain.length < 2} className="btn-workspace btn-primary">
+                                      {deploying ? 'Deploying...' : 'Deploy'}
+                                    </button>
+                                    <button type="button" onClick={() => setShowSubdomainInput(false)} className="btn-workspace btn-secondary">
+                                      <X className="w-3.5 h-3.5" /> Cancel
+                                    </button>
+                                  </div>
+                                </form>
+                              )}
+
+                              {deployments.length === 0 ? (
+                                <div className="ed-stat">No deployments yet — deploy your first project.</div>
+                              ) : (
+                                deployments.map((d, i) => (
+                                  <div key={i} className="ed-stat" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem' }}>
+                                    <div style={{ minWidth: 0 }}>
+                                      <div className="text-sm" style={{ color: d.deployedUrl ? '#12dce5' : '#c7d2dd' }}>
+                                        {d.deployedUrl ? (
+                                          <a href={d.deployedUrl} target="_blank" rel="noreferrer" style={{ color: '#12dce5' }}>{d.deployedUrl}</a>
+                                        ) : d.subdomain ? (
+                                          <span>{d.subdomain}.buildrshq.dev</span>
+                                        ) : (
+                                          <span>{d._id || `Deploy #${i + 1}`}</span>
+                                        )}
+                                      </div>
+                                      <div className="text-xs" style={{ color: '#748194' }}>
+                                        {d.status} {(d.projectId?.name ? `• ${d.projectId.name}` : '')} • {d.createdAt ? new Date(d.createdAt).toLocaleString() : ''}
+                                      </div>
+                                    </div>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flexShrink: 0 }}>
+                                      <span className="pill pill-mono" style={
+                                        d.status === 'success' ? { background: 'rgba(3,186,3,0.12)', color: '#56e5a9' } :
+                                          d.status === 'failed' ? { background: 'rgba(236,20,20,0.12)', color: '#ec1414' } :
+                                            d.status === 'building' || d.status === 'deploying' ? { background: 'rgba(229,184,74,0.12)', color: '#e5b84a' } :
+                                              { background: 'rgba(255,255,255,0.06)', color: '#9aaeba' }
+                                      }>{d.status}</span>
+                                      <button type="button" onClick={() => setLogDeployId(d._id)} className="text-xs" style={{ color: '#9aaeba' }} title="View logs">
+                                        Logs
+                                      </button>
+                                      {(d.status === 'success' || d.status === 'failed') && (
+                                        <button type="button" onClick={() => handleStop(d._id, d.subdomain)} className="text-xs" style={{ color: '#ec1414' }}>Stop</button>
+                                      )}
+                                    </div>
+                                  </div>
+                                ))
+                              )}
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    )}
                   </>
                 )}
               </div>
-            </div>
-
-            <div className="ed-breadcrumb">
-              {selectedFile ? (
-                <>
-                  <FolderOpen className="w-3 h-3" style={{ color: '#12dce5' }} />
-                  <span>{selectedProject ? selectedProject.name : selectedRepo ? (selectedRepo.fullName || selectedRepo.name) : 'workspace'}</span>
-                  {filePathSegs.map((seg, i) => (
-                    <span key={`${seg}-${i}`} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
-                      <span className="ed-breadcrumb-sep">›</span>
-                      <span style={i === filePathSegs.length - 1 ? { color: '#c7d2dd' } : undefined}>{seg}</span>
-                    </span>
-                  ))}
-                </>
-              ) : (
-                <span style={{ color: '#748194' }}>No file open — select a file from the Explorer</span>
-              )}
-            </div>
-
-            <div className="ed-editor">
-              {status && (
-                <div className={`ed-alert ${status.type === 'success' ? 'ed-alert-success' : 'ed-alert-error'}`}>
-                  {status.type === 'success' ? <CheckCircle className="w-4 h-4" /> : <XCircle className="w-4 h-4" />}
-                  {status.msg}
-                </div>
-              )}
-              {!selectedFile ? (
-                <div className="ed-ide-empty">
-                  <FileCode className="w-8 h-8" />
-                  <p>Select a file to start editing</p>
-                  <button type="button" className="btn-workspace btn-primary" onClick={() => startInlineCreate()}>New File</button>
-                </div>
-              ) : (
-                <div className="ed-code-wrap">
-                  {fileLoading && (
-                    <div className="ed-file-loading" role="status">
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      Loading file…
-                    </div>
-                  )}
-                  <MonacoEditor
-                    height="100%"
-                    language={monacoLanguage}
-                    value={content}
-                    onChange={handleEditorChange}
-                    onMount={handleEditorMount}
-                    beforeMount={handleEditorWillMount}
-                    theme="buildrs-figma"
-                    options={monacoOptions}
-                    loading={<div className="ed-ide-empty">Loading editor...</div>}
-                  />
-                </div>
-              )}
-            </div>
-
-            {/* ---- Bottom panel ---- */}
-            {panel && (
-              <div className="ed-panel">
-                <div className="ed-panelbar">
-                  {[
-                    { id: 'terminal', label: 'Terminal', icon: Terminal },
-                    { id: 'problems', label: 'Problems', icon: AlertCircle },
-                    { id: 'tests', label: 'Tests', icon: CheckCircle },
-                  ].map((t) => (
-                    <button key={t.id} type="button" className={`ed-panel-tab ${panel === t.id ? 'is-active' : ''}`} onClick={() => setPanel(t.id)}>
-                      <t.icon className="w-3.5 h-3.5" /> {t.label}
-                      {t.id === 'problems' && (problemCounts.error > 0 || blockCount > 0) && (
-                        <span style={{ color: problemCounts.error > 0 ? '#ec1414' : '#e5b84a' }}> {problemCounts.error || blockCount}</span>
-                      )}
-                    </button>
-                  ))}
-                  <div className="ed-panel-actions">
-                    {panel === 'tests' && outputLines.length > 0 && (
-                      <button type="button" className="ed-panel-close" onClick={copyOutput} title="Copy output">
-                        <Copy className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                    {panel === 'tests' && outputLines.length > 0 && (
-                      <button type="button" className="ed-panel-close" onClick={clearOutput} title="Clear output">
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                    <button type="button" className="ed-panel-close" onClick={() => setPanel(null)} title="Close panel"><X className="w-4 h-4" /></button>
-                  </div>
-                </div>
-
-                <div className="ed-panel-body">
-                  {panel === 'terminal' && (
-                    <div className="ed-term-shell">
-                      <div className="ed-term-toolbar">
-                        <div className="ed-term-meta">
-                          <span className={`ed-term-capsule ${termInfo ? 'is-live' : ''}`}>{termInfo ? 'LIVE' : 'CONNECTING'}</span>
-                          <span className="ed-term-label">
-                            {termInfo ? (termInfo.type === 'pty' ? 'Workspace Shell · PTY' : 'Workspace Shell · simulated') : 'Workspace Shell'}
-                            {(selectedRepo || selectedProject) && (
-                              <span className="ed-term-scope">
-                                {' — '}
-                                {selectedRepo
-                                  ? (selectedRepo.fullName || selectedRepo.name)
-                                  : selectedProject?.name}
-                              </span>
-                            )}
-                          </span>
-                        </div>
-                        <div className="ed-term-actions">
-                          <span className="ed-term-pill">{termInfo?.type === 'simulated' ? 'Bash (sim)' : 'Bash'}</span>
-                          {termInfo?.sessionId && <span className="ed-term-pill">{String(termInfo.sessionId).slice(-10)}</span>}
-                        </div>
-                      </div>
-                      <div ref={terminalRef} className="ed-term-root" />
-                    </div>
-                  )}
-
-                  {panel === 'problems' && (
-                    <>
-                      <div className="ed-stat">
-                        {problemCounts.error === 0 && problemCounts.warning === 0 && problemCounts.info === 0 ? (
-                          <>
-                            <CheckCircle className="w-3.5 h-3.5 ed-status-ok" style={{ verticalAlign: '-2px', marginRight: '0.4rem' }} />
-                            0 errors · 0 warnings — no problems detected
-                          </>
-                        ) : (
-                          <>
-                            <AlertCircle className="w-3.5 h-3.5" style={{ color: problemCounts.error ? '#ec1414' : '#e5b84a', verticalAlign: '-2px', marginRight: '0.4rem' }} />
-                            {problemCounts.error} error(s) · {problemCounts.warning} warning(s) · {problemCounts.info} info
-                          </>
-                        )}
-                      </div>
-                      {allProblems.length > 0 && (
-                        <div style={{ overflowY: 'auto', minHeight: 0, flex: 1 }}>
-                          {allProblems.map((p, i) => (
-                            <button
-                              key={`${p.file || ''}:${p.line || 0}:${p.column || 0}:${i}`}
-                              type="button"
-                              className="ed-scm-file ed-scm-file-btn"
-                              style={{
-                                width: '100%', textAlign: 'left',
-                                color: p.severity === 'error' ? '#ec1414' : p.severity === 'warning' ? '#e5b84a' : '#56e5a9',
-                              }}
-                              onClick={() => {
-                                if (p.line) jumpToProblem(p);
-                              }}
-                              title={p.message}
-                            >
-                              <span style={{ display: 'flex', gap: '0.4rem', alignItems: 'baseline' }}>
-                                <span style={{ color: '#748194', fontSize: '0.66rem', whiteSpace: 'nowrap' }}>
-                                  {p.file ? `${p.file}:` : ''}{p.line || 1}:{p.column || 1}
-                                </span>
-                                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.message}</span>
-                              </span>
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                      {blockCount > 0 ? (
-                        <div className="ed-stat">
-                          <AlertCircle className="w-3.5 h-3.5" style={{ color: '#e5b84a', verticalAlign: '-2px', marginRight: '0.4rem' }} />
-                          {blockCount} language(s) unavailable on your current tier — upgrade to unlock {blockCount <= 1 ? 'it' : 'them'}.
-                        </div>
-                      ) : null}
-                      {modifiedCount > 0 && (
-                        <div className="ed-stat">
-                          <GitBranch className="w-3.5 h-3.5" style={{ color: '#e5b84a', verticalAlign: '-2px', marginRight: '0.4rem' }} />
-                          {modifiedCount} modified file(s) — commit them from Source Control.
-                        </div>
-                      )}
-                      {!allProblems.length && !blockCount && !modifiedCount && (
-                        <div className="ed-stat">All systems nominal. No problems to report.</div>
-                      )}
-                    </>
-                  )}
-
-                  {panel === 'tests' && (
-                    <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, flex: 1, fontFamily: 'var(--figma-font-mono)', fontSize: '0.72rem' }}>
-                      {outputLines.length === 0 ? (
-                        <div className="ed-empty" style={{ flex: 1 }}>
-                          <Play className="w-6 h-6" />
-                          <p className="text-xs">Run a file to see its output and results here</p>
-                        </div>
-                      ) : (
-                        <div style={{ overflowY: 'auto', minHeight: 0, flex: 1, padding: '0.35rem 0.6rem' }}>
-                          {outputLines.map((l, i) => {
-                            const segs = ansiSegments(l.text);
-                            return (
-                              <div
-                                key={i}
-                                style={{
-                                  whiteSpace: 'pre-wrap', wordBreak: 'break-word', lineHeight: 1.5,
-                                  color: l.kind === 'err' ? '#ec1414' : l.kind === 'sys' ? '#56e5a9' : '#c7d2dd',
-                                }}
-                              >
-                                {segs.length === 0 ? ' ' : segs.map((seg, j) => (
-                                  <span
-                                    key={j}
-                                    style={{
-                                      ...(seg.fg ? { color: seg.fg } : null),
-                                      ...(seg.bg ? { backgroundColor: seg.bg } : null),
-                                      ...(seg.bold ? { fontWeight: 700 } : null),
-                                      ...(seg.dim ? { opacity: 0.65 } : null),
-                                      ...(seg.underline ? { textDecoration: 'underline' } : null),
-                                    }}
-                                  >
-                                    {seg.text}
-                                  </span>
-                                ))}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {panel === 'preview' && (
-                    <>
-                      <div className="ed-intel-grid">
-                        <div className="ed-intel-card">
-                          <span className="ed-intel-label">Preview</span>
-                          <strong>{sandboxUrl ? 'Live' : 'Idle'}</strong>
-                          <small>{sandboxUrl ? 'Sandbox is running' : 'No sandbox started yet'}</small>
-                        </div>
-                        <div className="ed-intel-card">
-                          <span className="ed-intel-label">Design</span>
-                          <strong>{selectedFigmaFile ? 'Connected' : 'Not linked'}</strong>
-                          <small>{selectedFigmaFile ? selectedFigmaFile.name || 'Selected design' : 'Connect a Figma file to generate code'}</small>
-                        </div>
-                        <div className="ed-intel-card">
-                          <span className="ed-intel-label">Active file</span>
-                          <strong>{selectedFile ? selectedFile.name : 'No file'}</strong>
-                          <small>{selectedFile ? `${selectedFile.language || detectLanguage(selectedFile.name)} source` : 'Open a file to preview it'}</small>
-                        </div>
-                      </div>
-                      {sandboxUrl ? (
-                        <iframe src={sandboxUrl} className="w-full flex-1" style={{ background: '#ffffff', border: 'none', borderRadius: '6px', minHeight: 0 }} title="Live preview" />
-                      ) : (
-                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem', minHeight: 0, flex: 1 }}>
-                          <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                            <span className="ed-sidebar-title">Figma Design</span>
-                            {!selectedFigmaFile ? (
-                              figmaFiles.length === 0 ? (
-                                <div className="ed-stat" style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '0.6rem' }}>
-                                  <Layers className="w-6 h-6" style={{ color: '#748194' }} />
-                                  <span>No Figma files added yet</span>
-                                  <a href="/figma" className="btn-workspace btn-secondary">Add Figma file</a>
-                                </div>
-                              ) : (
-                                <div style={{ overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '0.2rem' }}>
-                                  {figmaFiles.map((f) => (
-                                    <button key={f.key || f.id} type="button" className="ed-drop-item" onClick={() => setSelectedFigmaFile(f)}>
-                                      <Layers className="w-3.5 h-3.5" />
-                                      <span style={{ minWidth: 0 }}>
-                                        <span className="block truncate text-xs">{f.name || f.key}</span>
-                                        <span className="block text-xs" style={{ color: '#748194' }}>{f.last_modified ? new Date(f.last_modified).toLocaleDateString() : ''}</span>
-                                      </span>
-                                    </button>
-                                  ))}
-                                </div>
-                              )
-                            ) : (
-                              <div className="ed-design-pane" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                                <div className="ed-stat" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.4rem' }}>
-                                  <button type="button" onClick={() => setSelectedFigmaFile(null)} style={{ color: '#12dce5', background: 'none', border: 'none', cursor: 'pointer', fontSize: '0.66rem' }}>← All files</button>
-                                  <span className="truncate" style={{ color: '#c7d2dd' }}>{selectedFigmaFile.name || selectedFigmaFile.key}</span>
-                                </div>
-                                <div style={{ flex: 1, minHeight: 0, overflow: 'auto', background: '#0a0d15', border: '1px solid rgba(255,255,255,0.09)', borderRadius: 6, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                                  {selectedFigmaFile.thumbnail_url ? (
-                                    <img src={selectedFigmaFile.thumbnail_url} alt={selectedFigmaFile.name || 'design'} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
-                                  ) : (
-                                    <Layers className="w-8 h-8" style={{ color: '#2a3446' }} />
-                                  )}
-                                </div>
-                                <button type="button" className="btn-workspace btn-primary" onClick={generateFromDesign}>
-                                  <Bot className="w-3.5 h-3.5" /> Generate React code
-                                </button>
-                              </div>
-                            )}
-                          </div>
-                          <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                            <span className="ed-sidebar-title">Code</span>
-                            <div className="ed-code-wrap">
-                              {selectedFile ? (
-                                <MonacoEditor height="100%" language={monacoLanguage} value={content} onChange={handleEditorChange} theme="buildrs-figma"
-                                  beforeMount={handleEditorWillMount}
-                                  options={monacoPreviewOptions} />
-                              ) : (
-                                <div className="ed-ide-empty">Select a file to preview</div>
-                              )}
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                    </>
-                  )}
-
-                  {panel === 'deploy' && (
-                    <>
-                      <div className="ed-intel-grid">
-                        <div className="ed-intel-card">
-                          <span className="ed-intel-label">Deploys</span>
-                          <strong>{deployments.length}</strong>
-                          <small>Current deployment records</small>
-                        </div>
-                        <div className="ed-intel-card">
-                          <span className="ed-intel-label">Environment</span>
-                          <strong>{subscription ? tierDisplayLabel(subscription) : tierBadgeLabel(subscription?.tier)}</strong>
-                          <small>{blockCount ? `${blockCount} language(s) locked` : 'Full toolchain enabled'}</small>
-                        </div>
-                        <div className="ed-intel-card">
-                          <span className="ed-intel-label">Workspace</span>
-                          <strong>{selectedProject ? selectedProject.name : 'Default'}</strong>
-                          <small>{workspaceId ? 'Linked and ready to ship' : 'Add a workspace to deploy'}</small>
-                        </div>
-                      </div>
-                      <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'center', flexWrap: 'wrap' }}>
-                        <button type="button" className="btn-workspace btn-primary" onClick={handleDeploy}>
-                          <Rocket className="w-4 h-4" /> New Deployment
-                        </button>
-                        <button type="button" className="btn-workspace btn-secondary" onClick={() => loadDeployments({ forceRefresh: true })}>
-                          <RefreshCw className="w-3.5 h-3.5" /> Refresh
-                        </button>
-                        {deployScopeId && (
+              {assistantDockOpen && selectedFile && !projectPickerOpen && (
+                <aside className="ed-assistant-dock" aria-label="AI Assistant">
+                  <header className="ed-assistant-dock-header">
+                    <div className="ed-assistant-dock-kicker">AI Assistant</div>
+                    <h2>{selectedProject?.name || selectedRepo?.fullName || selectedRepo?.name || selectedFile.name}</h2>
+                    <p>Context from your active file</p>
+                  </header>
+                  {aiMessages.length === 0 ? (
+                    <div className="ed-assistant-dock-content">
+                      <section className="ed-assistant-suggestion">
+                        <h3>{allProblems.length ? 'Review this failure' : 'Review this file'}</h3>
+                        <p>
+                          {allProblems.length
+                            ? `Inspect the ${allProblems[0].severity || 'reported'} issue in ${allProblems[0].file || selectedFile.name} before making changes.`
+                            : `Ask a question about ${selectedFile.name} or request help with a test failure.`}
+                        </p>
                         <button
                           type="button"
-                          className="btn-workspace btn-secondary"
-                          onClick={() => setAutoDeploy(!autoDeployOn)}
-                          title={autoDeployOn ? 'Auto-deploy is ON: saving republishes this workspace' : 'Auto-deploy is OFF: save without republishing'}
-                          aria-pressed={autoDeployOn}
+                          onClick={() => {
+                            const issue = allProblems[0];
+                            const latestError = [...outputLines].reverse().find((line) => line.kind === 'err')?.text;
+                            const context = issue
+                              ? `${issue.severity || 'problem'} in ${issue.file || selectedFile.name}:${issue.line || 1}: ${issue.message}`
+                              : latestError || `the current test or run for ${selectedFile.name}`;
+                            handleAiHelperSend(
+                              null,
+                              `Explain this failure using the active file context. Format the answer as: a one-sentence finding; Failing test: file path — assertion; Likely cause: explanation; What to check: next steps. Be explicit if evidence is insufficient. Do not modify files. Context: ${context}`
+                            );
+                          }}
+                          disabled={aiLoading}
                         >
-                          Auto-Deploy
-                          <span className={`mkt-mono`} style={{ fontSize: '10px', marginLeft: '6px', padding: '1px 7px', borderRadius: 999, background: autoDeployOn ? 'rgba(3,186,3,0.15)' : 'rgba(255,255,255,0.08)', color: autoDeployOn ? '#03ba03' : '#9aaeba' }}>
-                            {autoDeployOn ? 'ON' : 'OFF'}
-                          </span>
+                          Explain Failure
                         </button>
+                      </section>
+                      <section className="ed-assistant-context">
+                        <h3>In context</h3>
+                        <span>{selectedFile.name}</span>
+                        {allProblems.find((problem) => problem.file && problem.file !== selectedFile.name)?.file && (
+                          <span>{allProblems.find((problem) => problem.file && problem.file !== selectedFile.name).file}</span>
                         )}
-                        <span className="text-xs" style={{ color: '#748194' }}>One-click static deploy → .buildrshq.dev</span>
-                      </div>
-
-                      {showSubdomainInput && (
-                        <form onSubmit={confirmDeploy} className="ed-stat" style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
-                          <label className="ws-label" style={{ color: '#9aaeba' }}>Choose a subdomain</label>
-                          {(() => {
-                            const secretFiles = gatherDeploymentFiles().filter((f) =>
-                              /(^|\/)\.env(\.|$)/i.test(`${f.path || ''}/${f.name || ''}`));
-                            return secretFiles.length > 0 ? (
-                              <p className="text-xs" style={{ color: '#e5b84a' }}>
-                                Includes {secretFiles.length} secret file{secretFiles.length === 1 ? '' : 's'}
-                                {secretFiles[0]?.name ? ` (${secretFiles.slice(0, 3).map((f) => f.name).join(', ')})` : ''} — values ship with this deploy.
-                              </p>
-                            ) : null;
-                          })()}                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                            <input type="text" value={deploySubdomain} onChange={(e) => setDeploySubdomain(e.target.value.replace(/[^a-z0-9-]/g, '-').toLowerCase())}
-                              placeholder="my-app" className="ws-input"
-                              style={{ fontFamily: 'var(--figma-font-mono)', background: '#0a0d15', borderColor: '#2a3446' }}
-                              autoFocus required minLength={2} />
-                            <span className="text-sm whitespace-nowrap" style={{ color: '#748194' }}>.buildrshq.dev</span>
-                            <button type="submit" disabled={deploying || deploySubdomain.length < 2} className="btn-workspace btn-primary">
-                              {deploying ? 'Deploying...' : 'Deploy'}
-                            </button>
-                            <button type="button" onClick={() => setShowSubdomainInput(false)} className="btn-workspace btn-secondary">
-                              <X className="w-3.5 h-3.5" /> Cancel
-                            </button>
-                          </div>
-                        </form>
-                      )}
-
-                      {deployments.length === 0 ? (
-                        <div className="ed-stat">No deployments yet — deploy your first project.</div>
-                      ) : (
-                        deployments.map((d, i) => (
-                          <div key={i} className="ed-stat" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem' }}>
-                            <div style={{ minWidth: 0 }}>
-                              <div className="text-sm" style={{ color: d.deployedUrl ? '#12dce5' : '#c7d2dd' }}>
-                                {d.deployedUrl ? (
-                                  <a href={d.deployedUrl} target="_blank" rel="noreferrer" style={{ color: '#12dce5' }}>{d.deployedUrl}</a>
-                                ) : d.subdomain ? (
-                                  <span>{d.subdomain}.buildrshq.dev</span>
-                                ) : (
-                                  <span>{d._id || `Deploy #${i + 1}`}</span>
-                                )}
-                              </div>
-                              <div className="text-xs" style={{ color: '#748194' }}>
-                                {d.status} {(d.projectId?.name ? `• ${d.projectId.name}` : '')} • {d.createdAt ? new Date(d.createdAt).toLocaleString() : ''}
-                              </div>
+                        <span>{selectedBranch || gitStatus?.branch || 'main'}</span>
+                      </section>
+                    </div>
+                  ) : (
+                    <div className="ed-assistant-dock-messages" aria-live="polite">
+                      {aiMessages.map((message, index) => {
+                        if (message.role === 'user') {
+                          return (
+                            <div key={`${message.role}-${index}`} className="ed-chat-bubble is-user">
+                              {message.content}
                             </div>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', flexShrink: 0 }}>
-                              <span className="pill pill-mono" style={
-                                d.status === 'success' ? { background: 'rgba(3,186,3,0.12)', color: '#56e5a9' } :
-                                d.status === 'failed' ? { background: 'rgba(236,20,20,0.12)', color: '#ec1414' } :
-                                d.status === 'building' || d.status === 'deploying' ? { background: 'rgba(229,184,74,0.12)', color: '#e5b84a' } :
-                                { background: 'rgba(255,255,255,0.06)', color: '#9aaeba' }
-                              }>{d.status}</span>
-                              <button type="button" onClick={() => setLogDeployId(d._id)} className="text-xs" style={{ color: '#9aaeba' }} title="View logs">
-                                Logs
-                              </button>
-                              {(d.status === 'success' || d.status === 'failed') && (
-                                <button type="button" onClick={() => handleStop(d._id, d.subdomain)} className="text-xs" style={{ color: '#ec1414' }}>Stop</button>
-                              )}
-                            </div>
+                          );
+                        }
+                        return renderStructuredAssistantMessage(message, index);
+                      })}
+                      {aiLoading && (
+                        <section className="ed-assistant-reading" aria-live="polite">
+                          <div className="ed-assistant-reading-agent">AI Agent</div>
+                          <h3>Reading your file...</h3>
+                          <p>I'm tracing the relevant code paths and matching them to your question.</p>
+                          <div className="ed-assistant-reading-checks">
+                            {aiCurrentFileIsPrivate
+                              ? <span>Active file excluded for privacy</span>
+                              : <span><CheckCircle className="w-3.5 h-3.5" /> Active file attached</span>}
+                            {aiCurrentFileIsPrivate
+                              ? null
+                              : aiReadMethod
+                                ? <span><CheckCircle className="w-3.5 h-3.5" /> Located {aiReadMethod}()</span>
+                                : <span>Scanning for relevant code...</span>}
                           </div>
-                        ))
+                          <small>Preparing an explanation...</small>
+                        </section>
                       )}
-</>
+                    </div>
+                  )}
+                  <form className="ed-assistant-dock-composer" onSubmit={handleAiHelperSend}>
+                    <input
+                      type="text"
+                      value={aiInput}
+                      onChange={(event) => setAiInput(event.target.value)}
+                      placeholder="Ask for an explanation or design guidance..."
+                      aria-label="Ask the AI assistant about this file"
+                    />
+                    <div className="ed-assistant-dock-composer-footer">
+                      {renderAiModelSelector('is-dock-model', 'Choose an AI model')}
+                      <button type="submit" disabled={aiLoading || !aiInput.trim()} aria-label="Send message">
+                        {aiLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <ArrowUp className="w-4 h-4" />}
+                      </button>
+                    </div>
+                    {aiModelsError && <small className="ed-assistant-model-error" role="status">{aiModelsError}</small>}
+                  </form>
+                  <div className="ed-assistant-dock-safety">
+                    {aiCurrentFileIsPrivate ? 'Sensitive file excluded for privacy' : 'Active file context · Read only'}
+                  </div>
+                </aside>
+              )}
+            </div>
+
+            {/* ---- Status bar ---- */}
+            <footer className={`ed-statusbar ${!selectedFile ? 'is-welcome-empty' : ''}`}>
+              <div className="ed-status-left">
+                <span className="ed-status-icon" title="Branch">
+                  <GitBranch className="w-3 h-3" />
+                  <span>{gitStatus?.branch || 'main'}</span>
+                </span>
+                <span className="ed-status-icon" title="Git sync" onClick={() => handleGitAction('status')}>
+                  <RefreshCw className={`w-3 h-3 ${saving || loading ? 'animate-spin' : ''}`} />
+                  {modifiedCount > 0 && <span data-badge={modifiedCount}>MC</span>}
+                </span>
+                <span className="ed-status-icon" title="Live collaborators">
+                  <Users className="w-3 h-3" />
+                  <span>{collaborators.length}{Object.keys(remoteCursors).length > collaborators.length ? '+' : ''}</span>
+                </span>
+              </div>
+              <div className="ed-status-right">
+                {dirty && <span className="ed-status-icon" style={{ color: '#e5b84a' }} title="Unsaved changes">● Modified</span>}
+                <button type="button" className="ed-status-item" onClick={() => setPaletteOpen(true)} title="Command Palette (⌘P)">
+                  <Search className="w-3 h-3" /> ⌘P
+                </button>
+                <span className="ed-status-item">Ln {cursorPos.line}, Col {cursorPos.col}</span>
+                <span className="ed-status-item">{(selectedFile?.language || detectLanguage(selectedFile?.name) || 'text').toUpperCase()}</span>
+                <span className="ed-status-item">UTF-8</span>
+                <span className="ed-status-item">Spaces: 2</span>
+                <span className={`ed-tier-badge ${tierBadgeClass(subscription?.tier)}`} title={tierDisplayDetail(subscription)}>
+                  {subscription ? tierDisplayLabel(subscription) : tierBadgeLabel(subscription?.tier)}
+                </span>
+              </div>
+            </footer>
+          </div>
+
+          {repoCreateOpen && (
+            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4" style={{ zIndex: 9999 }}>
+              <div className="ws-modal w-full max-w-lg" style={{ position: 'relative', zIndex: 1 }}>
+                <div className="flex items-center justify-between p-5 border-b border-[rgba(255,255,255,0.09)]">
+                  <div className="flex items-center gap-2.5">
+                    <span className="card-ico">
+                      <GitBranch className="w-4 h-4" />
+                    </span>
+                    <h2 className="ws-modal-title">Create GitHub Repository</h2>
+                  </div>
+                  <button type="button" onClick={() => { setRepoCreateOpen(false); setRepoCreateError(null); }} className="text-muted hover:text-white"><X className="w-5 h-5" /></button>
+                </div>
+                <form onSubmit={handleCreateGithubRepo} className="p-5 space-y-4">
+                  <div>
+                    <label className="ws-label">Repository Name</label>
+                    <input type="text" value={repoCreateName} onChange={(e) => setRepoCreateName(e.target.value)} placeholder="my-project" className="ws-input" autoFocus required />
+                  </div>
+                  <div>
+                    <label className="ws-label">Description</label>
+                    <textarea value={repoCreateDescription} onChange={(e) => setRepoCreateDescription(e.target.value)} placeholder="Project summary and purpose" className="ws-textarea w-full font-mono text-sm" rows={3} />
+                  </div>
+                  <label className="flex items-center gap-2 text-sm" style={{ color: '#c7d2dd' }}>
+                    <input type="checkbox" checked={repoCreatePrivate} onChange={(e) => setRepoCreatePrivate(e.target.checked)} />
+                    Make this repository private
+                  </label>
+                  {repoCreateError && <p className="text-xs text-[#ec1414]">{repoCreateError}</p>}
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', paddingTop: '0.5rem' }}>
+                    <button type="button" className="btn-workspace btn-secondary" onClick={() => { setRepoCreateOpen(false); setRepoCreateError(null); }}>Cancel</button>
+                    <button type="submit" className="btn-workspace btn-primary flex items-center gap-2" disabled={repoCreateBusy || !repoCreateName.trim()}>
+                      <GitBranch className="w-4 h-4" />
+                      {repoCreateBusy ? 'Creating...' : 'Create Repo'}
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+
+          {paletteOpen && (
+            <div className="ed-palette-backdrop" onClick={() => setPaletteOpen(false)}>
+              <div className="ed-palette" onClick={(e) => e.stopPropagation()}>
+                <div className="ed-palette-head">
+                  <Search className="w-4 h-4" />
+                  <input
+                    autoFocus
+                    className="ed-palette-input"
+                    placeholder="Type a command or file name..."
+                    value={paletteQuery}
+                    onChange={(e) => { setPaletteQuery(e.target.value); setPaletteIndex(0); }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'ArrowDown') { e.preventDefault(); setPaletteIndex((i) => Math.min(i + 1, paletteEntries.length - 1)); }
+                      else if (e.key === 'ArrowUp') { e.preventDefault(); setPaletteIndex((i) => Math.max(i - 1, 0)); }
+                      else if (e.key === 'Enter') { e.preventDefault(); const ent = paletteEntries[paletteIndex]; if (ent) runPaletteEntry(ent); }
+                      else if (e.key === 'Escape') { setPaletteOpen(false); }
+                    }}
+                  />
+                </div>
+                <div className="ed-palette-list">
+                  {paletteEntries.length === 0 ? (
+                    <div className="ed-palette-empty">No matching commands or files</div>
+                  ) : (
+                    paletteEntries.map((ent, i) => (
+                      <button key={`${ent.kind}-${ent.label}-${i}`} type="button"
+                        className={`ed-palette-item ${i === paletteIndex ? 'is-hl' : ''}`}
+                        onMouseEnter={() => setPaletteIndex(i)}
+                        onClick={() => runPaletteEntry(ent)}>
+                        <ent.icon className="w-4 h-4" />
+                        <span>{ent.label}</span>
+                        <span className="ed-palette-kind">{ent.kind}</span>
+                      </button>
+                    ))
                   )}
                 </div>
               </div>
-            )}
-          </div>
-        </div>
+            </div>
+          )}
 
-        {/* ---- Status bar ---- */}
-          <footer className="ed-statusbar">
-            <div className="ed-status-left">
-              <span className="ed-status-icon" title="Branch">
-                <GitBranch className="w-3 h-3" />
-                <span>{gitStatus?.branch || 'main'}</span>
-              </span>
-              <span className="ed-status-icon" title="Git sync" onClick={() => handleGitAction('status')}>
-                <RefreshCw className={`w-3 h-3 ${saving || loading ? 'animate-spin' : ''}`} />
-                {modifiedCount > 0 && <span data-badge={modifiedCount}>MC</span>}
-              </span>
-              <span className="ed-status-icon" title="Live collaborators">
-                <Users className="w-3 h-3" />
-                <span>{collaborators.length}{Object.keys(remoteCursors).length > collaborators.length ? '+' : ''}</span>
-              </span>
-            </div>
-            <div className="ed-status-right">
-              {dirty && <span className="ed-status-icon" style={{ color: '#e5b84a' }} title="Unsaved changes">● Modified</span>}
-              <button type="button" className="ed-status-item" onClick={() => setPaletteOpen(true)} title="Command Palette (⌘P)">
-                <Search className="w-3 h-3" /> ⌘P
-              </button>
-              <span className="ed-status-item">Ln {cursorPos.line}, Col {cursorPos.col}</span>
-              <span className="ed-status-item">{(selectedFile?.language || detectLanguage(selectedFile?.name) || 'text').toUpperCase()}</span>
-              <span className="ed-status-item">UTF-8</span>
-              <span className="ed-status-item">Spaces: 2</span>
-              <span className={`ed-tier-badge ${tierBadgeClass(subscription?.tier)}`} title={tierDisplayDetail(subscription)}>
-                {subscription ? tierDisplayLabel(subscription) : tierBadgeLabel(subscription?.tier)}
-              </span>
-            </div>
-          </footer>
-        </div>
-
-      {repoCreateOpen && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4" style={{ zIndex: 9999 }}>
-          <div className="ws-modal w-full max-w-lg" style={{ position: 'relative', zIndex: 1 }}>
-            <div className="flex items-center justify-between p-5 border-b border-[rgba(255,255,255,0.09)]">
-              <div className="flex items-center gap-2.5">
-                <span className="card-ico">
-                  <GitBranch className="w-4 h-4" />
-                </span>
-                <h2 className="ws-modal-title">Create GitHub Repository</h2>
-              </div>
-              <button type="button" onClick={() => { setRepoCreateOpen(false); setRepoCreateError(null); }} className="text-muted hover:text-white"><X className="w-5 h-5" /></button>
-            </div>
-            <form onSubmit={handleCreateGithubRepo} className="p-5 space-y-4">
-              <div>
-                <label className="ws-label">Repository Name</label>
-                <input type="text" value={repoCreateName} onChange={(e) => setRepoCreateName(e.target.value)} placeholder="my-project" className="ws-input" autoFocus required />
-              </div>
-              <div>
-                <label className="ws-label">Description</label>
-                <textarea value={repoCreateDescription} onChange={(e) => setRepoCreateDescription(e.target.value)} placeholder="Project summary and purpose" className="ws-textarea w-full font-mono text-sm" rows={3} />
-              </div>
-              <label className="flex items-center gap-2 text-sm" style={{ color: '#c7d2dd' }}>
-                <input type="checkbox" checked={repoCreatePrivate} onChange={(e) => setRepoCreatePrivate(e.target.checked)} />
-                Make this repository private
-              </label>
-              {repoCreateError && <p className="text-xs text-[#ec1414]">{repoCreateError}</p>}
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', paddingTop: '0.5rem' }}>
-                <button type="button" className="btn-workspace btn-secondary" onClick={() => { setRepoCreateOpen(false); setRepoCreateError(null); }}>Cancel</button>
-                <button type="submit" className="btn-workspace btn-primary flex items-center gap-2" disabled={repoCreateBusy || !repoCreateName.trim()}>
-                  <GitBranch className="w-4 h-4" />
-                  {repoCreateBusy ? 'Creating...' : 'Create Repo'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {paletteOpen && (
-        <div className="ed-palette-backdrop" onClick={() => setPaletteOpen(false)}>
-          <div className="ed-palette" onClick={(e) => e.stopPropagation()}>
-            <div className="ed-palette-head">
-              <Search className="w-4 h-4" />
-              <input
-                autoFocus
-                className="ed-palette-input"
-                placeholder="Type a command or file name..."
-                value={paletteQuery}
-                onChange={(e) => { setPaletteQuery(e.target.value); setPaletteIndex(0); }}
-                onKeyDown={(e) => {
-                  if (e.key === 'ArrowDown') { e.preventDefault(); setPaletteIndex((i) => Math.min(i + 1, paletteEntries.length - 1)); }
-                  else if (e.key === 'ArrowUp') { e.preventDefault(); setPaletteIndex((i) => Math.max(i - 1, 0)); }
-                  else if (e.key === 'Enter') { e.preventDefault(); const ent = paletteEntries[paletteIndex]; if (ent) runPaletteEntry(ent); }
-                  else if (e.key === 'Escape') { setPaletteOpen(false); }
-                }}
-              />
-            </div>
-            <div className="ed-palette-list">
-              {paletteEntries.length === 0 ? (
-                <div className="ed-palette-empty">No matching commands or files</div>
-              ) : (
-                paletteEntries.map((ent, i) => (
-                  <button key={`${ent.kind}-${ent.label}-${i}`} type="button"
-                    className={`ed-palette-item ${i === paletteIndex ? 'is-hl' : ''}`}
-                    onMouseEnter={() => setPaletteIndex(i)}
-                    onClick={() => runPaletteEntry(ent)}>
-                    <ent.icon className="w-4 h-4" />
-                    <span>{ent.label}</span>
-                    <span className="ed-palette-kind">{ent.kind}</span>
-                  </button>
-                ))
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {aboutOpen && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4" onClick={() => setAboutOpen(false)}>
-          <div className="ws-modal w-full max-w-md" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center justify-between p-5 border-b border-[rgba(255,255,255,0.09)]">
-              <div className="flex items-center gap-2.5">
-                <span className="card-ico">
-                  <Puzzle className="w-4 h-4" />
-                </span>
-                <h2 className="ws-modal-title">Buildrs HQ IDE</h2>
-              </div>
-              <button type="button" onClick={() => setAboutOpen(false)} className="text-muted hover:text-white"><X className="w-5 h-5" /></button>
-            </div>
-            <div className="p-5 space-y-4">
-              <div>
-                <p className="text-sm font-medium mb-1" style={{ color: '#ffffff' }}>Version 1.0 · Code editor with Live Share</p>
-                <p className="text-xs" style={{ color: '#9aaeba', lineHeight: 1.6 }}>
-                  Enterprise editor: version control, one-click deploys, sandboxed terminal,
-                  AI assistance and real-time collaboration.
-                </p>
-              </div>
-              <div>
-                <p className="ws-label">Keyboard Shortcuts</p>
-                <div className="ed-stat" style={{ lineHeight: 2 }}>
-                  ⌘S Save · ⌘R Run · ⌘B Toggle Sidebar · ⌘P Command Palette<br />
-                  ⌘` Terminal · ⌘W Close Tab · ⌘N New File
+          {aboutOpen && (
+            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4" onClick={() => setAboutOpen(false)}>
+              <div className="ws-modal w-full max-w-md" onClick={(e) => e.stopPropagation()}>
+                <div className="flex items-center justify-between p-5 border-b border-[rgba(255,255,255,0.09)]">
+                  <div className="flex items-center gap-2.5">
+                    <span className="card-ico">
+                      <Puzzle className="w-4 h-4" />
+                    </span>
+                    <h2 className="ws-modal-title">Buildrs HQ IDE</h2>
+                  </div>
+                  <button type="button" onClick={() => setAboutOpen(false)} className="text-muted hover:text-white"><X className="w-5 h-5" /></button>
                 </div>
-              </div>
-              <div className="flex justify-end gap-3">
-                <a href="/support" className="btn-workspace btn-secondary">Contact Support</a>
-                <button type="button" className="btn-workspace btn-primary" onClick={() => setAboutOpen(false)}>Got it</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      <ConfirmDialog
-        isOpen={!!confirmDiscard}
-        onClose={() => setConfirmDiscard(null)}
-        onConfirm={handleConfirmDiscard}
-        title="Unsaved Changes"
-        message="You have unsaved changes. Discard them and switch files?"
-        confirmText="Discard"
-        variant="warning"
-      />
-      <ConfirmDialog
-        isOpen={!!confirmClose}
-        onClose={() => setConfirmClose(null)}
-        onConfirm={handleConfirmClose}
-        title="Unsaved Changes"
-        message={`Close "${confirmClose?.name || 'this file'}" without saving?`}
-        confirmText="Close"
-        variant="warning"
-      />
-      <ConfirmDialog
-        isOpen={!!confirmDelete}
-        onClose={() => setConfirmDelete(null)}
-        onConfirm={handleConfirmDelete}
-        title="Delete File"
-        message={`Are you sure you want to delete "${confirmDelete?.name || 'this file'}"?`}
-        confirmText="Delete"
-        variant="danger"
-      />
-      <ConfirmDialog
-        isOpen={!!confirmStop}
-        onClose={() => setConfirmStop(null)}
-        onConfirm={handleConfirmStop}
-        title="Stop Deployment"
-        message={`Stop deployment "${confirmStop?.subdomain || ''}.buildrshq.dev"?`}
-        confirmText="Stop"
-        variant="danger"
-      />
-      <ConfirmDialog
-        isOpen={!!confirmScopeSwitch}
-        onClose={() => setConfirmScopeSwitch(null)}
-        onConfirm={handleConfirmScopeSwitch}
-        title="Switch workspace?"
-        message="A terminal session is running — switching will kill it along with any running builds and scrollback."
-        confirmText="Switch anyway"
-        variant="warning"
-      />
-
-      {logDeployId && (
-        <DeploymentLogsModal
-          deploymentId={logDeployId}
-          onClose={() => setLogDeployId(null)}
-          onUpdate={handleDeploymentUpdate}
-        />
-      )}
-
-      {diffOpen && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-          <div className="ws-modal w-full max-w-3xl" style={{ display: 'flex', flexDirection: 'column', maxHeight: '82vh' }}>
-            <div className="flex items-center justify-between p-5 border-b border-[rgba(255,255,255,0.09)]">
-              <div className="flex items-center gap-2.5">
-                <span className="card-ico">
-                  <GitBranch className="w-4 h-4" />
-                </span>
-                <h2 className="ws-modal-title">Diff — {diffFile}</h2>
-              </div>
-              <button type="button" onClick={() => setDiffOpen(false)} className="text-muted hover:text-white"><X className="w-5 h-5" /></button>
-            </div>
-            <div className="p-5" style={{ overflow: 'auto', flex: 1 }}>
-              {diffLoading ? (
-                <div className="flex items-center gap-2 text-sm text-muted">
-                  <Loader2 className="w-4 h-4 animate-spin" /> Loading diff...
-                </div>
-              ) : diffData && diffData.length > 0 ? (
-                diffData.map((file, i) => (
-                  <div key={i} className="mb-4">
-                    <p className="ed-stat" style={{ color: '#9aaeba', marginBottom: 6 }}>
-                      {file.oldPath !== file.newPath ? `${file.oldPath} → ${file.newPath}` : file.newPath}
+                <div className="p-5 space-y-4">
+                  <div>
+                    <p className="text-sm font-medium mb-1" style={{ color: '#ffffff' }}>Version 1.0 · Code editor with Live Share</p>
+                    <p className="text-xs" style={{ color: '#9aaeba', lineHeight: 1.6 }}>
+                      Enterprise editor: version control, one-click deploys, sandboxed terminal,
+                      AI assistance and real-time collaboration.
                     </p>
-                    {file.hunks.map((hunk, j) => (
-                      <div key={j} className="ws-code-block">
-                        <p className="ed-stat" style={{ color: '#e5b84a', padding: '0.2rem 0.5rem' }}>
-                          @@ -{hunk.oldStart},{hunk.oldLines} +{hunk.newStart},{hunk.newLines} @@ {hunk.header}
+                  </div>
+                  <div>
+                    <p className="ws-label">Keyboard Shortcuts</p>
+                    <div className="ed-stat" style={{ lineHeight: 2 }}>
+                      ⌘S Save · ⌘R Run · ⌘B Toggle Sidebar · ⌘P Command Palette<br />
+                      ⌘` Terminal · ⌘W Close Tab · ⌘N New File
+                    </div>
+                  </div>
+                  <div className="flex justify-end gap-3">
+                    <a href="/support" className="btn-workspace btn-secondary">Contact Support</a>
+                    <button type="button" className="btn-workspace btn-primary" onClick={() => setAboutOpen(false)}>Got it</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <ConfirmDialog
+            isOpen={!!confirmDiscard}
+            onClose={() => setConfirmDiscard(null)}
+            onConfirm={handleConfirmDiscard}
+            title="Unsaved Changes"
+            message="You have unsaved changes. Discard them and switch files?"
+            confirmText="Discard"
+            variant="warning"
+          />
+          <ConfirmDialog
+            isOpen={!!confirmClose}
+            onClose={() => setConfirmClose(null)}
+            onConfirm={handleConfirmClose}
+            title="Unsaved Changes"
+            message={`Close "${confirmClose?.name || 'this file'}" without saving?`}
+            confirmText="Close"
+            variant="warning"
+          />
+          <ConfirmDialog
+            isOpen={!!confirmDelete}
+            onClose={() => setConfirmDelete(null)}
+            onConfirm={handleConfirmDelete}
+            title="Delete File"
+            message={`Are you sure you want to delete "${confirmDelete?.name || 'this file'}"?`}
+            confirmText="Delete"
+            variant="danger"
+          />
+          <ConfirmDialog
+            isOpen={!!confirmStop}
+            onClose={() => setConfirmStop(null)}
+            onConfirm={handleConfirmStop}
+            title="Stop Deployment"
+            message={`Stop deployment "${confirmStop?.subdomain || ''}.buildrshq.dev"?`}
+            confirmText="Stop"
+            variant="danger"
+          />
+          <ConfirmDialog
+            isOpen={!!confirmScopeSwitch}
+            onClose={() => setConfirmScopeSwitch(null)}
+            onConfirm={handleConfirmScopeSwitch}
+            title="Switch workspace?"
+            message="A terminal session is running — switching will kill it along with any running builds and scrollback."
+            confirmText="Switch anyway"
+            variant="warning"
+          />
+
+          {logDeployId && (
+            <DeploymentLogsModal
+              deploymentId={logDeployId}
+              onClose={() => setLogDeployId(null)}
+              onUpdate={handleDeploymentUpdate}
+            />
+          )}
+
+          {diffOpen && (
+            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+              <div className="ws-modal w-full max-w-3xl" style={{ display: 'flex', flexDirection: 'column', maxHeight: '82vh' }}>
+                <div className="flex items-center justify-between p-5 border-b border-[rgba(255,255,255,0.09)]">
+                  <div className="flex items-center gap-2.5">
+                    <span className="card-ico">
+                      <GitBranch className="w-4 h-4" />
+                    </span>
+                    <h2 className="ws-modal-title">Diff — {diffFile}</h2>
+                  </div>
+                  <button type="button" onClick={() => setDiffOpen(false)} className="text-muted hover:text-white"><X className="w-5 h-5" /></button>
+                </div>
+                <div className="p-5" style={{ overflow: 'auto', flex: 1 }}>
+                  {diffLoading ? (
+                    <div className="flex items-center gap-2 text-sm text-muted">
+                      <Loader2 className="w-4 h-4 animate-spin" /> Loading diff...
+                    </div>
+                  ) : diffData && diffData.length > 0 ? (
+                    diffData.map((file, i) => (
+                      <div key={i} className="mb-4">
+                        <p className="ed-stat" style={{ color: '#9aaeba', marginBottom: 6 }}>
+                          {file.oldPath !== file.newPath ? `${file.oldPath} → ${file.newPath}` : file.newPath}
                         </p>
-                        {hunk.changes.map((chg, k) => (
-                          <div
-                            key={k}
-                            className="ws-diff-line"
-                            style={{
-                              color: chg.type === 'add' ? '#7ee787' : chg.type === 'remove' ? '#ff7b72' : '#c7d2dd',
-                              background: chg.type === 'add' ? 'rgba(46,160,67,0.15)' : chg.type === 'remove' ? 'rgba(248,81,73,0.15)' : 'transparent',
-                              whiteSpace: 'pre-wrap',
-                              fontFamily: 'var(--figma-font-mono)',
-                              fontSize: '0.72rem',
-                              lineHeight: 1.5,
-                              padding: '0.1rem 0.5rem',
-                            }}
-                          >
-                            {chg.type === 'add' ? '+' : chg.type === 'remove' ? '-' : ' '}{chg.content}
+                        {file.hunks.map((hunk, j) => (
+                          <div key={j} className="ws-code-block">
+                            <p className="ed-stat" style={{ color: '#e5b84a', padding: '0.2rem 0.5rem' }}>
+                              @@ -{hunk.oldStart},{hunk.oldLines} +{hunk.newStart},{hunk.newLines} @@ {hunk.header}
+                            </p>
+                            {hunk.changes.map((chg, k) => (
+                              <div
+                                key={k}
+                                className="ws-diff-line"
+                                style={{
+                                  color: chg.type === 'add' ? '#7ee787' : chg.type === 'remove' ? '#ff7b72' : '#c7d2dd',
+                                  background: chg.type === 'add' ? 'rgba(46,160,67,0.15)' : chg.type === 'remove' ? 'rgba(248,81,73,0.15)' : 'transparent',
+                                  whiteSpace: 'pre-wrap',
+                                  fontFamily: 'var(--figma-font-mono)',
+                                  fontSize: '0.72rem',
+                                  lineHeight: 1.5,
+                                  padding: '0.1rem 0.5rem',
+                                }}
+                              >
+                                {chg.type === 'add' ? '+' : chg.type === 'remove' ? '-' : ' '}{chg.content}
+                              </div>
+                            ))}
                           </div>
                         ))}
                       </div>
-                    ))}
-                  </div>
-                ))
-              ) : (
-                <p className="text-sm text-muted">No diff found for this file.</p>
-              )}
-            </div>
-            <div className="p-4 border-t border-[rgba(255,255,255,0.09)]">
-              <button type="button" className="btn-workspace btn-secondary" onClick={() => setDiffOpen(false)}>Close</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {prOpen && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-          <div className="ws-modal w-full max-w-lg">
-            <div className="flex items-center justify-between p-5 border-b border-[rgba(255,255,255,0.09)]">
-              <div className="flex items-center gap-2.5">
-                <span className="card-ico">
-                  <GitPullRequestArrow className="w-4 h-4" />
-                </span>
-                <h2 className="ws-modal-title">Create Pull Request</h2>
-              </div>
-              <button type="button" onClick={() => { setPrOpen(false); setPrError(null); setPrDone(null); }} className="text-muted hover:text-white"><X className="w-5 h-5" /></button>
-            </div>
-            <form onSubmit={createPR} className="p-5 space-y-4">
-              {selectedRepo ? (
-                <p className="text-xs text-muted">
-                  Repo: <b className="text-white">{selectedRepo.fullName || `${selectedRepo.owner}/${selectedRepo.name}`}</b> ·
-                  head: <b className="text-white">{gitStatus?.branch || 'main'}</b>
-                </p>
-              ) : (
-                <p className="text-xs text-[#ec1414]">Select a GitHub repository in the Explorer first.</p>
-              )}
-              <div>
-                <label className="ws-label">Title *</label>
-                <input type="text" value={prTitle} onChange={(e) => setPrTitle(e.target.value)} className="ws-input" placeholder="Summary of changes" required disabled={!selectedRepo} />
-              </div>
-              <div>
-                <label className="ws-label">Body</label>
-                <textarea value={prBody} onChange={(e) => setPrBody(e.target.value)} className="ws-input" rows={4} placeholder="Describe the motivation and changes" disabled={!selectedRepo} />
-              </div>
-              <div className="flex items-center gap-3">
-                <div className="flex-1">
-                  <label className="ws-label">Base branch</label>
-                  <input type="text" value={prBase} onChange={(e) => setPrBase(e.target.value)} className="ws-input" placeholder="main" disabled={!selectedRepo} />
-                </div>
-                <div className="flex-1">
-                  <label className="ws-label">Head branch</label>
-                  <input type="text" value={gitStatus?.branch || 'main'} className="ws-input" disabled />
-                </div>
-              </div>
-              {prError && <p className="text-xs text-[#ec1414]">{prError}</p>}
-              {prDone && <p className="text-xs text-[#7ee787]">{prDone}</p>}
-              <div className="flex justify-end gap-3">
-                <button type="button" className="btn-workspace btn-secondary" onClick={() => { setPrOpen(false); setPrError(null); setPrDone(null); }}>Cancel</button>
-                <button type="submit" className="btn-workspace btn-primary" disabled={prBusy || !selectedRepo}>
-                  {prBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <GitPullRequestArrow className="w-4 h-4" />}
-                  {prBusy ? 'Creating...' : 'Create Pull Request'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {codegenOpen && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-          <div className="ws-modal w-full max-w-2xl" style={{ display: 'flex', flexDirection: 'column', maxHeight: '86vh' }}>
-            <div className="flex items-center justify-between p-5 border-b border-[rgba(255,255,255,0.09)]">
-              <div className="flex items-center gap-2.5">
-                <span className="card-ico">
-                  <Layers className="w-4 h-4" />
-                </span>
-                <h2 className="ws-modal-title">Design → Code</h2>
-              </div>
-              <button type="button" onClick={() => setCodegenOpen(false)} className="text-muted hover:text-white"><X className="w-5 h-5" /></button>
-            </div>
-            <div className="p-5" style={{ overflow: 'auto', flex: 1 }}>
-              {codegenLoading ? (
-                <div className="flex items-center gap-2 text-sm text-muted">
-                  <Loader2 className="w-4 h-4 animate-spin" /> Reading design and generating code...
-                </div>
-              ) : codegenError ? (
-                <p className="text-sm text-[#ec1414]">{codegenError}</p>
-              ) : codegenResult ? (
-                <div className="space-y-4">
-                  <p className="text-xs text-muted">
-                    {codegenResult.title} · {codegenResult.target} · {codegenResult.files?.length || 0} file(s) · {codegenResult.tokenCount || 0} tokens found
-                  </p>
-                  {codegenResult.files?.length > 0 ? (
-                    codegenResult.files.map((f, i) => (
-                      <div key={i} className="ws-code-block">
-                        <div className="ed-stat" style={{ padding: '0.3rem 0.6rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem' }}>
-                          <span>{f.name}</span>
-                          <button type="button" className="btn-workspace btn-secondary" style={{ fontSize: '0.66rem', padding: '0.15rem 0.5rem' }} onClick={() => saveCodegenFile(f)}>
-                            Save to project
-                          </button>
-                        </div>
-                        <textarea readOnly value={f.content} style={{ width: '100%', minHeight: 180, background: '#111', color: '#c7d2dd', border: 'none', outline: 'none', fontFamily: 'var(--figma-font-mono)', fontSize: '0.72rem', lineHeight: 1.5, padding: '0.6rem', resize: 'vertical', whiteSpace: 'pre', overflow: 'auto' }} />
-                      </div>
                     ))
                   ) : (
-                    <pre className="text-xs" style={{ color: '#c7d2dd', whiteSpace: 'pre-wrap', fontFamily: 'var(--figma-font-mono)' }}>{codegenResult.content}</pre>
+                    <p className="text-sm text-muted">No diff found for this file.</p>
                   )}
                 </div>
-              ) : null}
+                <div className="p-4 border-t border-[rgba(255,255,255,0.09)]">
+                  <button type="button" className="btn-workspace btn-secondary" onClick={() => setDiffOpen(false)}>Close</button>
+                </div>
+              </div>
             </div>
-            <div className="p-4 border-t border-[rgba(255,255,255,0.09)] flex items-center justify-between gap-3">
-              {codegenResult && !codegenLoading && (
-                <button type="button" className="btn-workspace btn-primary" onClick={generateFromDesign}>
-                  <RefreshCw className="w-4 h-4" /> Regenerate
-                </button>
-              )}
-              <button type="button" className="btn-workspace btn-secondary" onClick={() => setCodegenOpen(false)}>Close</button>
+          )}
+
+          {prOpen && (
+            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+              <div className="ws-modal w-full max-w-lg">
+                <div className="flex items-center justify-between p-5 border-b border-[rgba(255,255,255,0.09)]">
+                  <div className="flex items-center gap-2.5">
+                    <span className="card-ico">
+                      <GitPullRequestArrow className="w-4 h-4" />
+                    </span>
+                    <h2 className="ws-modal-title">Create Pull Request</h2>
+                  </div>
+                  <button type="button" onClick={() => { setPrOpen(false); setPrError(null); setPrDone(null); }} className="text-muted hover:text-white"><X className="w-5 h-5" /></button>
+                </div>
+                <form onSubmit={createPR} className="p-5 space-y-4">
+                  {selectedRepo ? (
+                    <p className="text-xs text-muted">
+                      Repo: <b className="text-white">{selectedRepo.fullName || `${selectedRepo.owner}/${selectedRepo.name}`}</b> ·
+                      head: <b className="text-white">{gitStatus?.branch || 'main'}</b>
+                    </p>
+                  ) : (
+                    <p className="text-xs text-[#ec1414]">Select a GitHub repository in the Explorer first.</p>
+                  )}
+                  <div>
+                    <label className="ws-label">Title *</label>
+                    <input type="text" value={prTitle} onChange={(e) => setPrTitle(e.target.value)} className="ws-input" placeholder="Summary of changes" required disabled={!selectedRepo} />
+                  </div>
+                  <div>
+                    <label className="ws-label">Body</label>
+                    <textarea value={prBody} onChange={(e) => setPrBody(e.target.value)} className="ws-input" rows={4} placeholder="Describe the motivation and changes" disabled={!selectedRepo} />
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <div className="flex-1">
+                      <label className="ws-label">Base branch</label>
+                      <input type="text" value={prBase} onChange={(e) => setPrBase(e.target.value)} className="ws-input" placeholder="main" disabled={!selectedRepo} />
+                    </div>
+                    <div className="flex-1">
+                      <label className="ws-label">Head branch</label>
+                      <input type="text" value={gitStatus?.branch || 'main'} className="ws-input" disabled />
+                    </div>
+                  </div>
+                  {prError && <p className="text-xs text-[#ec1414]">{prError}</p>}
+                  {prDone && <p className="text-xs text-[#7ee787]">{prDone}</p>}
+                  <div className="flex justify-end gap-3">
+                    <button type="button" className="btn-workspace btn-secondary" onClick={() => { setPrOpen(false); setPrError(null); setPrDone(null); }}>Cancel</button>
+                    <button type="submit" className="btn-workspace btn-primary" disabled={prBusy || !selectedRepo}>
+                      {prBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <GitPullRequestArrow className="w-4 h-4" />}
+                      {prBusy ? 'Creating...' : 'Create Pull Request'}
+                    </button>
+                  </div>
+                </form>
+              </div>
             </div>
-          </div>
-        </div>
-      )}
+          )}
+
+          {codegenOpen && (
+            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+              <div className="ws-modal w-full max-w-2xl" style={{ display: 'flex', flexDirection: 'column', maxHeight: '86vh' }}>
+                <div className="flex items-center justify-between p-5 border-b border-[rgba(255,255,255,0.09)]">
+                  <div className="flex items-center gap-2.5">
+                    <span className="card-ico">
+                      <Layers className="w-4 h-4" />
+                    </span>
+                    <h2 className="ws-modal-title">Design → Code</h2>
+                  </div>
+                  <button type="button" onClick={() => setCodegenOpen(false)} className="text-muted hover:text-white"><X className="w-5 h-5" /></button>
+                </div>
+                <div className="p-5" style={{ overflow: 'auto', flex: 1 }}>
+                  {codegenLoading ? (
+                    <div className="flex items-center gap-2 text-sm text-muted">
+                      <Loader2 className="w-4 h-4 animate-spin" /> Reading design and generating code...
+                    </div>
+                  ) : codegenError ? (
+                    <p className="text-sm text-[#ec1414]">{codegenError}</p>
+                  ) : codegenResult ? (
+                    <div className="space-y-4">
+                      <p className="text-xs text-muted">
+                        {codegenResult.title} · {codegenResult.target} · {codegenResult.files?.length || 0} file(s) · {codegenResult.tokenCount || 0} tokens found
+                      </p>
+                      {codegenResult.files?.length > 0 ? (
+                        codegenResult.files.map((f, i) => (
+                          <div key={i} className="ws-code-block">
+                            <div className="ed-stat" style={{ padding: '0.3rem 0.6rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.5rem' }}>
+                              <span>{f.name}</span>
+                              <button type="button" className="btn-workspace btn-secondary" style={{ fontSize: '0.66rem', padding: '0.15rem 0.5rem' }} onClick={() => saveCodegenFile(f)}>
+                                Save to project
+                              </button>
+                            </div>
+                            <textarea readOnly value={f.content} style={{ width: '100%', minHeight: 180, background: '#111', color: '#c7d2dd', border: 'none', outline: 'none', fontFamily: 'var(--figma-font-mono)', fontSize: '0.72rem', lineHeight: 1.5, padding: '0.6rem', resize: 'vertical', whiteSpace: 'pre', overflow: 'auto' }} />
+                          </div>
+                        ))
+                      ) : (
+                        <pre className="text-xs" style={{ color: '#c7d2dd', whiteSpace: 'pre-wrap', fontFamily: 'var(--figma-font-mono)' }}>{codegenResult.content}</pre>
+                      )}
+                    </div>
+                  ) : null}
+                </div>
+                <div className="p-4 border-t border-[rgba(255,255,255,0.09)] flex items-center justify-between gap-3">
+                  {codegenResult && !codegenLoading && (
+                    <button type="button" className="btn-workspace btn-primary" onClick={generateFromDesign}>
+                      <RefreshCw className="w-4 h-4" /> Regenerate
+                    </button>
+                  )}
+                  <button type="button" className="btn-workspace btn-secondary" onClick={() => setCodegenOpen(false)}>Close</button>
+                </div>
+              </div>
+            </div>
+          )}
         </main>
       </div>
     </AuthGuard>

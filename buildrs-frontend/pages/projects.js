@@ -59,6 +59,16 @@ export default function Projects() {
     loadProjects();
   }, [loadProjects]);
 
+  const requestedCreateSource = router.isReady && typeof router.query.createSource === 'string'
+    ? router.query.createSource
+    : null;
+  useEffect(() => {
+    if (requestedCreateSource !== 'github' && requestedCreateSource !== 'scratch') return;
+    setCreateSourceType(requestedCreateSource);
+    setIsCreatingProject(true);
+    router.replace('/projects', undefined, { shallow: true });
+  }, [router, requestedCreateSource]);
+
   if (!hasHydrated) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-[#0e141d] text-white">

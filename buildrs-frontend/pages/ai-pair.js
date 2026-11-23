@@ -668,7 +668,9 @@ export default function AiPair() {
       const savedIsValid = Boolean(saved?.provider && saved?.model && saved.model !== saved.provider);
       const available = savedIsValid && (data.providers || []).some((provider) =>
         provider.key === saved?.provider &&
-        (provider.type === 'cloud' ? provider.model === saved?.model : provider.models?.includes(saved?.model))
+        (provider.type === 'cloud'
+          ? (provider.models || [provider.model]).includes(saved?.model)
+          : provider.models?.includes(saved?.model))
       );
       const defaultProvider = (data.providers || []).find((provider) => provider.key === data.defaultProvider);
       const defaultModel = defaultProvider?.type === 'cloud'
