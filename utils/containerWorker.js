@@ -2,6 +2,7 @@ const dockerode = require('dockerode');
 const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { resolveSandboxImage } = require('./sandboxImages');
 const docker = new dockerode({ socketPath: '/var/run/docker.sock' });
 
 class ContainerWorkerService {
@@ -32,10 +33,11 @@ class ContainerWorkerService {
     }
 
     const workerId = `agent-${taskId}`;
-    const image = options.image || 'node:18-alpine';
     const workspacePath = `/workspace/${workspaceId}/${taskId}`;
 
     try {
+      // Allowlisted images only — the worker mounts the workspace read-write.
+      const image = resolveSandboxImage(options.image);
       const container = await docker.createContainer({
         Image: image,
         name: workerId,

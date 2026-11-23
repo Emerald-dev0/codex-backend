@@ -54,6 +54,10 @@ class PermissionMatrix {
       'git:push': ALL_TIERS,
       'git:pull': ALL_TIERS,
       'git:branch': ALL_TIERS,
+      // Merging is local-git power the free tier already has through
+      // commit + push; the REST route additionally refuses agent/* branches,
+      // which may only be merged through the agent approval flow.
+      'git:merge': ALL_TIERS,
 
       // Collaboration (joining is open; shared editing is paid)
       'collab:join': ALL_TIERS,

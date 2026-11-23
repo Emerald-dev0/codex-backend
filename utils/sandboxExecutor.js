@@ -11,6 +11,7 @@
 
 const { exec: childExec, spawn: childSpawn } = require('child_process');
 const sandboxSecurity = require('./sandboxSecurity');
+const { DEFAULT_SANDBOX_IMAGE, resolveSandboxImage } = require('./sandboxImages');
 
 /**
  * Host execution runs submitted code directly on the Node process's host with
@@ -20,6 +21,39 @@ const sandboxSecurity = require('./sandboxSecurity');
  */
 function hostExecAllowed() {
     return process.env.NODE_ENV !== 'production';
+}
+
+/**
+ * Dependency installers are an explicit allowlist of exec-form argv arrays.
+ * Callers pass a key, never a shell string: `installDeps` runs inside the
+ * sandbox with /workspace bind-mounted read-write, so any interpolation here
+ * would be command execution in that container.
+ */
+const ALLOWED_INSTALL_COMMANDS = Object.freeze({
+    npm: ['npm', 'ci', '--ignore-scripts', '--no-audit', '--no-fund'],
+    'npm-ci': ['npm', 'ci', '--ignore-scripts', '--no-audit', '--no-fund'],
+    'npm install': ['npm', 'install', '--ignore-scripts', '--no-audit', '--no-fund'],
+    yarn: ['yarn', 'install', '--frozen-lockfile', '--ignore-scripts'],
+    pnpm: ['pnpm', 'install', '--frozen-lockfile', '--ignore-scripts'],
+    pip: ['pip', 'install', '--no-input', '--no-cache-dir', '-r', 'requirements.txt'],
+    'pip install': ['pip', 'install', '--no-input', '--no-cache-dir', '-r', 'requirements.txt'],
+    composer: ['composer', 'install', '--no-interaction', '--no-scripts'],
+    bundler: ['bundle', 'install', '--no-cache'],
+    'go mod': ['go', 'mod', 'download'],
+    cargo: ['cargo', 'fetch', '--locked'],
+});
+
+/**
+ * Resolve a caller-supplied install command to an exec-form argv array.
+ * Throws on anything not in the allowlist instead of falling back to a shell.
+ */
+function resolveInstallCommand(value) {
+    const key = String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+    const cmd = ALLOWED_INSTALL_COMMANDS[key];
+    if (!cmd) {
+        throw new Error(`Unsupported install command: ${key.slice(0, 40)}`);
+    }
+    return cmd.slice();
 }
 
 class SandboxExecutor {
@@ -265,7 +299,7 @@ class SandboxExecutor {
             php: 'php:8.2-alpine'
         };
 
-        return images[language.toLowerCase()] || 'node:18-alpine';
+        return resolveSandboxImage(images[language.toLowerCase()] || DEFAULT_SANDBOX_IMAGE);
     }
 
     /**
@@ -323,6 +357,10 @@ class SandboxExecutor {
             throw new Error('Invalid userId/workspaceId');
         }
 
+        // Validate before touching Docker: an unknown command must fail fast
+        // rather than after a container has been created.
+        const installCmd = options.installDeps ? resolveInstallCommand(options.installDeps) : null;
+
         try {
             const container = await sandboxSecurity.createIsolatedContainer(userId, workspaceId, {
                 image: this.getDockerImage(language),
@@ -339,10 +377,9 @@ class SandboxExecutor {
                 );
             }
 
-            if (options.installDeps) {
-                await this._execInContainer(container,
-                    ['sh', '-c', `cd /workspace && ${options.installDeps}`]
-                );
+            if (installCmd) {
+                // Exec form, no shell: the argv array comes from the allowlist above.
+                await this._execInContainer(container, installCmd);
             }
 
             const execCmd = this.getDockerExecCmd(language, testCode);
