@@ -89,7 +89,11 @@ export function useCachedData(userId, key, fetcher, options = {}) {
   }, [currentUserId, fetcher]);
 
   const refresh = useCallback(async () => {
-    if (!currentUserId) return;
+    if (!currentUserId) {
+      setLoading(false);
+      setData([]);
+      return;
+    }
     try {
       setLoading(true);
       const result = await load();
