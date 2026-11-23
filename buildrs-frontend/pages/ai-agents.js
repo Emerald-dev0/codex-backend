@@ -1015,7 +1015,10 @@ function AiAgentsPage() {
     loading: loadingSessions,
     refresh: refreshSessions,
   } = useCachedData(userId, 'ai-sessions', async () => {
-    const data = await agentApi.sessions();
+    const data = await Promise.race([
+      agentApi.sessions(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Provider request timed out')), 8000))
+    ]);
     return { success: true, data: Array.isArray(data.sessions) ? data.sessions : [] };
   }, { refreshOnVisibility: true, intervalMs: 15000 });
 
