@@ -1012,6 +1012,7 @@ function AiAgentsPage() {
   const [sessions, setSessions] = useState([]);
   const [loadingSessions, setLoadingSessions] = useState(true);
   const [loadError, setLoadError] = useState('');
+  const [actionError, setActionError] = useState('');
 
   useEffect(() => {
     let active = true;
