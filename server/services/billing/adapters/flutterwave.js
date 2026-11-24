@@ -63,6 +63,17 @@ class FlutterwaveAdapter extends PaymentAdapter {
       currency: d.currency ? String(d.currency).toUpperCase() : null,
       amountMinor,
       amount: amountMinor == null ? null : amountMinor / 100,
+      // Payment-ledger facts (utils/paymentLedger). Not read by entitlements.
+      // Flutterwave refunds are keyed by the numeric transaction id.
+      ledger: {
+        objectId: d.id != null ? String(d.id) : null,
+        chargeId: d.id != null ? String(d.id) : null,
+        grossMinor: amountMinor,
+        paymentMethod: d.payment_type || '',
+        customerEmail: d.customer?.email || null,
+        customerName: d.customer?.name || null,
+        failureReason: !ok && d.processor_response ? String(d.processor_response) : '',
+      },
     };
   }
 

@@ -26,6 +26,9 @@ const {
 } = require('../utils/profilePictureStorage');
 const { sendInternalError } = require('../utils/httpErrors');
 const { enqueueEmailJob } = require('../utils/emailJobWorker');
+const { getSettings: getPlatformSettings } = require('../utils/platformSettings');
+const { validatePassword } = require('../utils/passwordPolicy');
+const { notifyAdmins } = require('../utils/adminNotifications');
 
 // Keep uploads in memory so the storage helper can choose R2 or the local
 // uploads directory (tests/development) without changing the route.
@@ -52,6 +55,17 @@ const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
     max: 5, // 5 requests per window
     store: require('../utils/redis').getRateLimitStore('auth'),
+    passOnStoreError: true,
+    message: { success: false, message: 'Too many attempts, please try again later.' }
+});
+
+// Second sign-in step (2FA code / resend). Separate bucket so a couple of
+// password typos don't lock a user out mid-verification; each challenge is
+// additionally capped at 5 code attempts (utils/twoFactor.js).
+const twoFactorLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    store: require('../utils/redis').getRateLimitStore('auth-2fa'),
     passOnStoreError: true,
     message: { success: false, message: 'Too many attempts, please try again later.' }
 });
@@ -128,6 +142,20 @@ router.post('/signup', authLimiter, async (req, res) => {
             });
         }
 
+        // Platform policy (Admin › Settings): registration gate + password rules.
+        const platformSettings = await getPlatformSettings();
+        if (!platformSettings.registration.allowRegistrations) {
+            return res.status(403).json({
+                success: false,
+                message: 'New registrations are currently closed.',
+                code: 'REGISTRATIONS_CLOSED'
+            });
+        }
+        const passwordCheck = await validatePassword(password);
+        if (!passwordCheck.ok) {
+            return res.status(400).json({ success: false, message: passwordCheck.message, code: 'WEAK_PASSWORD' });
+        }
+
         // Check if user already exists
         const existingUser = await User.findOne({ email: email.toLowerCase() });
         if (existingUser) {
@@ -162,6 +190,15 @@ router.post('/signup', authLimiter, async (req, res) => {
         } catch (queueError) {
             console.error('Trial welcome email queue error:', queueError.message);
         }
+
+        notifyAdmins({
+            type: 'user',
+            severity: 'info',
+            title: 'New account created',
+            message: `${user.fullName} · ${user.email}`,
+            link: `/users/${user._id}`,
+            dedupeKey: `user-signup:${user._id}`,
+        }).catch(() => {});
 
         res.status(201).json({
             success: true,
@@ -218,6 +255,50 @@ router.post('/signup', authLimiter, async (req, res) => {
  *       401:
  *         description: Invalid credentials
  */
+/**
+ * Final step of a successful sign-in (password, or password + 2FA): stamp
+ * lastLogin, issue the session token and return the client user payload.
+ */
+async function completeSignin(req, res, user, method) {
+    user.lastLogin = new Date();
+    await user.save();
+    const subscription = await getOrCreateSubscription(user._id);
+    const token = generateToken(user._id, user.tokenVersion);
+
+    const { addAuditLog } = require('../utils/auditLogService');
+    addAuditLog({
+        companyId: user.company?.toString(),
+        actorId: user._id,
+        email: user.email,
+        event: 'auth.signin',
+        category: 'auth',
+        target: user.email,
+        details: { method },
+        req
+    });
+
+    return res.json({
+        success: true,
+        message: 'Sign in successful',
+        token,
+        user: {
+            id: user._id,
+            fullName: user.fullName,
+            email: user.email,
+            profilePicture: user.profilePicture,
+            authProvider: user.authProvider,
+            role: user.role,
+            onboardingCompleted: user.onboardingCompleted,
+            subscription: {
+                tier: subscription.tier,
+                status: subscription.status,
+                trialEndsAt: subscription.trialEndsAt,
+                daysLeft: subscription.status === 'trial' ? subscription.getTrialDaysLeft() : 0,
+            }
+        }
+    });
+}
+
 // Sign In
 router.post('/signin', authLimiter, async (req, res) => {
     try {
@@ -267,8 +348,9 @@ router.post('/signin', authLimiter, async (req, res) => {
             });
         }
 
-        // Check if email is verified
-        if (!user.isVerified) {
+        // Check if email is verified (unless an admin turned the requirement off)
+        const signinSettings = await getPlatformSettings();
+        if (!user.isVerified && signinSettings.registration.requireEmailVerification !== false) {
             return res.status(403).json({ 
                 success: false, 
                 message: 'Please verify your email before signing in',
@@ -280,50 +362,57 @@ router.post('/signin', authLimiter, async (req, res) => {
         // Clear per-account lockout on successful signin
         await clearLockout(email.toLowerCase());
 
-        // Update last login
-        user.lastLogin = new Date();
-        await user.save();
-        const subscription = await getOrCreateSubscription(user._id);
-
-        // Generate token
-        const token = generateToken(user._id, user.tokenVersion);
-
-        const { addAuditLog } = require('../utils/auditLogService');
-        addAuditLog({
-            companyId: user.company?.toString(),
-            actorId: user._id,
-            email: user.email,
-            event: 'auth.signin',
-            category: 'auth',
-            target: user.email,
-            details: { method: 'password' },
-            req
-        });
-
-        res.json({
-            success: true,
-            message: 'Sign in successful',
-            token,
-            user: {
-                id: user._id,
-                fullName: user.fullName,
-                email: user.email,
-                profilePicture: user.profilePicture,
-                authProvider: user.authProvider,
-                role: user.role,
-                onboardingCompleted: user.onboardingCompleted,
-                subscription: {
-                    tier: subscription.tier,
-                    status: subscription.status,
-                    trialEndsAt: subscription.trialEndsAt,
-                    daysLeft: subscription.status === 'trial' ? subscription.getTrialDaysLeft() : 0,
+        // Admin › Settings › Security: second factor for every user, or for
+        // anyone who enrolled an authenticator app.
+        if (signinSettings.security?.requireUser2FA || user.twoFactor?.totpEnabled) {
+            const twoFactor = require('../utils/twoFactor');
+            try {
+                const challenge = await twoFactor.createChallenge(user, {
+                    purpose: 'user',
+                    allowedMethods: signinSettings.security.twoFactorMethods,
+                });
+                return res.json({ success: true, requires2FA: true, message: 'Enter your verification code', ...challenge });
+            } catch (challengeError) {
+                if (challengeError.statusCode) {
+                    return res.status(challengeError.statusCode).json({ success: false, message: challengeError.message, code: challengeError.code });
                 }
+                throw challengeError;
             }
-        });
+        }
+
+        return completeSignin(req, res, user, 'password');
 
     } catch (error) {
         console.error('Signin error:', error);
         return sendInternalError(req, res, error, { message: 'Error signing in' });
+    }
+});
+
+// Second step of sign-in when Admin › Settings requires 2FA.
+router.post('/signin/verify-2fa', twoFactorLimiter, async (req, res) => {
+    try {
+        const twoFactor = require('../utils/twoFactor');
+        const user = await twoFactor.verifyChallenge(req.body?.challengeToken, req.body?.code, 'user');
+        return completeSignin(req, res, user, '2fa');
+    } catch (error) {
+        if (error.statusCode) {
+            return res.status(error.statusCode).json({ success: false, message: error.message, code: error.code });
+        }
+        console.error('Signin 2FA error:', error);
+        return sendInternalError(req, res, error, { message: 'Error verifying code' });
+    }
+});
+
+router.post('/signin/resend-2fa', twoFactorLimiter, async (req, res) => {
+    try {
+        const twoFactor = require('../utils/twoFactor');
+        const result = await twoFactor.resendChallenge(req.body?.challengeToken, 'user');
+        return res.json({ success: true, ...result });
+    } catch (error) {
+        if (error.statusCode) {
+            return res.status(error.statusCode).json({ success: false, message: error.message, code: error.code });
+        }
+        return sendInternalError(req, res, error, { message: 'Error resending code' });
     }
 });
 
@@ -717,6 +806,10 @@ router.post('/change-password', authLimiter, authenticateToken, async (req, res)
                 success: false,
                 message: 'New password must be at least 8 characters long'
             });
+        }
+        const policyCheck = await validatePassword(newPassword);
+        if (!policyCheck.ok) {
+            return res.status(400).json({ success: false, message: policyCheck.message, code: 'WEAK_PASSWORD' });
         }
 
         // Verify current password

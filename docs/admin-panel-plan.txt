@@ -1,0 +1,344 @@
+# BuildrsHQ Admin Panel: Reconnaissance, Screen Inventory and Implementation Plan
+
+Status: **Phase 1 and 2 (plan). No implementation code yet.**
+Branch: `arena/80dc44cb-codex-backend` (base `26ce4f9`)
+
+---
+
+## 1. Reconnaissance findings
+
+### 1.1 Repository layout
+
+| Area | Location | Notes |
+|---|---|---|
+| Backend API | `server.js`, `routes/*.js` (52 routers), `server/routes/*.js` (phase-3 billing and rooms) | Express 4, Socket.IO, mounted under `/api/*` |
+| Models | `models/*.js` (46), `server/models/*.js` (`Entitlement`, `DebugRoom`) | Mongoose 8 / MongoDB |
+| Middleware | `middleware/*.js` | `auth.js` (JWT plus liveness/tokenVersion), rate limits, tier enforcement, trial, workspace access |
+| Services/utils | `utils/*.js`, `server/services/**` | billing (`entitlementService`, provider adapters), notifications, audit, email |
+| User frontend | `buildrs-frontend/` | Next.js 15 (pages router), React 18, Tailwind 3.4, zustand, lucide-react, framer-motion |
+| Legacy static frontend | `frontend/` | old signin/signup CSS only |
+| Tests | `tests/*.test.js` (~200 suites) | Jest and Supertest, run by `.github/workflows/ci.yml` on Node 18/20 |
+
+### 1.2 Conventions to follow
+
+- **Response envelope** (`utils/apiResponse.js`): `{ success: true, ...data }` / `{ success: false, message, code? }`.
+- **Errors** (`utils/httpErrors.js`): `sendError` / `sendInternalError`, never leak `error.message` on 5xx, request id in `X-Request-Id`.
+- **Pagination**: `utils/queryLimits.boundedLimit(value, default, max)`.
+- **Rate limits**: `express-rate-limit` with the Redis store from `utils/redis.getRateLimitStore(name)`.
+- **Audit**: `utils/adminAudit.recordAdminAction()` writes to `AdminAudit` (365-day TTL) and to stdout.
+- **Swagger** JSDoc blocks on routes (`config/swagger.js`).
+- Flat `routes/<feature>.js` plus `utils/<feature>Service.js`; models in `models/`.
+
+### 1.3 Authentication and authorisation (current state)
+
+- Users sign in through `POST /api/auth/signin` (email/password) or Google OAuth. The JWT is `{ userId, tokenVersion }`, HS256, 24h.
+- `middleware/auth.authenticateToken` verifies the JWT, then runs a **cached DB liveness check**. Banned or deleted users fail it, and a `tokenVersion` mismatch revokes the token (used by bans, password change and logout-all).
+- **There is no platform-admin role on `User`.** `routes/admin.js` says so directly. The existing admin endpoints use a static `x-admin-key` (`ADMIN_API_KEY`) and fail closed:
+  - `POST /api/admin/users/:id/ban`, `/unban`
+  - `POST/GET /api/admin/entitlements/:userId[/enterprise]`
+  - `POST /api/admin/companies/roles/backfill`
+- `SupportAgent` is a **separate** identity (own model and JWT `{ agentId }`) used by `pages/support-admin.js` to work support tickets.
+- Company-level roles (`owner/admin/member…`) exist in `Company` / `companyRoleService`. These are workspace roles, not platform roles.
+
+**Consequence:** the admin panel needs a real, server-enforced platform-admin identity. The plan below adds a `platformRole` to `User`. Admins sign in with the normal auth flow, and every admin route checks the role **against the database** on each request. Role claims in the token are never trusted.
+
+### 1.4 Domain data available today (and gaps)
+
+| Design needs | Existing source | Gap |
+|---|---|---|
+| Users, counts, sign-ups | `User` (`createdAt`, `lastLogin`, `isBanned`, `isVerified`) | No activity history, only a single `lastLogin` |
+| Subscribers, plan mix, MRR, status | `Subscription` (tier, status, pricing, start/end/nextBillingDate, provider) plus `Entitlement` | Covered |
+| Plan catalogue (6 plans) | `Subscription.tierConfigs` (code) and `buildrs-frontend/lib/plans.js` (code): developer, pro, pro_plus, team_standard, team_premium, enterprise | Plans are hard-coded. No Draft/Archived status, no editable copy |
+| **Transactions, invoices, refunds** | Webhooks go to `entitlementService.applyWebhookEvent` (updates the entitlement only). `BillingSchedule` holds scheduled charges only | **No payment ledger at all.** Successful, failed and refunded payments are not persisted |
+| Available balance / gateways | Stripe, Paystack and Flutterwave are configured (`config/*.js`) | No balance reads. **PayPal is not integrated** anywhere |
+| Withdrawals | n/a | No payout or transfer code |
+| Disputes (customer statement, attachments, timeline) | `SupportTicket` (category, priority, status, messages, attachments, referenceNumber) from the Support Center | Covered by reuse. Needs a disputed amount, a linked transaction and an activity timeline |
+| AI agent usage | `AgentExecution.model`, `AIPairSession` | Covered (aggregate by model). Models route through OpenRouter (`config/aiProviders.js`) |
+| Deployed projects | `Deployment` | Covered |
+| Retention cohorts / MAU | n/a | Needs per-day activity records |
+| Platform settings (registration, maintenance, password policy, 2FA) | n/a | Needs a settings store **and** enforcement hooks in the existing auth flows |
+| 2FA (SMS / Authenticator / Email) | Email OTP only (`models/OTP.js`, signup verification) | No TOTP, no SMS provider, no login-time 2FA |
+
+---
+
+## 2. Design references received
+
+Figma (`tnCiDorshTlhYYrFkhNpI1`) cannot be reached from this sandbox, so **the uploaded screenshots are the source of truth.** Received so far (1440 px desktop frames):
+
+| # | File | Screen |
+|---|---|---|
+| 1 | `Finances.png` | Finances (populated) |
+| 2 | `Finances — Empty state.png` | Finances (empty) |
+| 3 | `Finances — Withdraw modal open.png` | Withdraw funds modal |
+| 4 | `Finances - Transaction details - Successful.png` | Transaction details page |
+| 5 | `Billing Plan — Overview.png` | Billing and Plans overview |
+| 6 | `Billing Plan — Subscriber details modal open.png` | Subscriber details modal |
+| 7 | `Billing Plan - Manage plan.png` | Manage Plans (catalogue) |
+| 8 | `Dispute.png` | Dispute (populated) |
+| 9 | `Dispute — Empty state.png` | Dispute (empty) |
+| 10 | `Insights.png` | Insights (populated) |
+| 11 | `Insights — Empty state.png` | Insights (empty) |
+| 12 | `Settings.png` | Settings: General tab |
+| 13 | `Settings-1.png` | Settings: Account tab |
+| 14 | `Settings-2.png` | Settings: Security tab |
+| 15 | `Logout.png` | Logout confirmation modal (over an Overview screen) |
+| – | `Frame 2085662576–81.png` | Section title cards (Billing and Plans, Dispute, Insights, Settings, Logout) |
+
+### 2.1 Shared shell (from 14 of the 15 frames)
+
+- **Top bar** (96 px): logo plus "BuildrsHQ" wordmark (the "HQ" in accent), pill search (`#1d263b`-ish fill with a blue border), notification bell with a red count badge (badge hidden when the count is 0 in the empty states), and a "DU" initials avatar with the accent gradient.
+- **Sidebar** (242 px, `#0f131c`): "Manage Platform" label, then Overview, Users, Finance, Billing Plans, Dispute, Insights, Notification, Settings, Logout. The active item uses an accent text/icon plus a dark teal pill. The admin identity card sits at the bottom (avatar, name, role).
+- **Page header**: eyebrow "PLATFORM ADMINISTRATION" (accent, tracked caps), H1, subtitle. Detail pages swap the eyebrow for a back arrow.
+- **Cards**: `#0a0d15`-ish fill, 1px `rgba(255,255,255,0.1)` border, ~8px radius. Stat cards show a label, a big number, and a delta line (green up arrow / amber / muted).
+- **Tables**: a header row on a raised fill (uppercase), row dividers, a status pill (green Active/Successful/Paid, amber Pending/Expired, red Failed), an accent "View details/View More" link, and a footer with "Showing x–y of N" plus page numbers and Previous/Next.
+- **Buttons**: primary is the accent fill `#12dce5` with dark text. Secondary is a dark fill with a border.
+- **Toggles**: accent track when on, grey when off.
+- **Empty states**: a 56px teal-tinted rounded icon tile, a bold title, a muted explanation, and an optional primary CTA.
+- Tokens already exist in `buildrs-frontend/styles/design-tokens.css` and `tailwind.config.js` (`figma.*`). The admin panel will reuse the same values.
+
+---
+
+## 3. Screen inventory
+
+Legend: ✅ designed (screenshot received) · 🟡 partially visible / implied · ❌ not yet designed (awaiting your references; **will not be invented**).
+
+### 3.1 Admin sign-in ❌
+- **Purpose:** authenticate a platform admin. Not in the uploads, but required for the panel to work.
+- **Proposal:** a minimal form using the same tokens. It calls the existing `POST /api/auth/signin`, then `GET /api/admin/me`. Non-admins get a "no admin access" state.
+- **Awaiting:** a design, if one exists in Figma.
+
+### 3.2 Overview 🟡 (visible only behind the Logout modal)
+- **Purpose:** platform health at a glance.
+- **Layout seen:** "Welcome back, Daniel". Stat cards for Total users, Monthly recurring revenue, Active workspaces and Open disputes. A Platform growth line chart (active users over time). Subscription mix (stacked bar plus a per-plan list). A Recent platform activity table (Account, Activity, Status, Time). A "Needs your attention" checklist (disputes near SLA, failed payments, unread conversations). Date range and "Export report" buttons.
+- ⚠️ This frame uses an **older shell** (breadcrumbs, a "Production" badge, Messages and Disputes counts in the sidebar, a "Log out" item). It conflicts with the other 14 frames.
+- **Data:** users, subscriptions, support tickets, the payment ledger, and recent activity (AdminAudit plus sign-ups and payments).
+- **API:** `GET /api/admin/overview?from&to`, `GET /api/admin/overview/export` (CSV).
+- **Awaiting:** the standalone Overview frame (populated and empty) in the current shell.
+
+### 3.3 Users ❌
+- In the sidebar on every frame, but no screen received.
+- **Expected (to confirm with design):** a user list with search, filters and pagination, plus user details and actions (ban/unban already exists server-side, plan override via entitlements).
+- **Awaiting:** the list, details and action designs.
+
+### 3.4 Finances ✅ (populated and empty)
+- **Purpose:** monitor revenue, reconcile payments, manage transactions.
+- **Components:**
+  - **Stat cards:** Monthly recurring revenue (+% vs last month), Collected this month (+%), Outstanding invoices (amount, "N invoices awaiting payment"), Refunds issued (amount, % of gross revenue).
+  - **Available balance and Bank card:** total balance, then gateway rows for PayPal (account email), Paystack and Flutterwave. Empty state: "No payment gateway connected" with a **Connect gateway** CTA.
+  - **Revenue performance card:** this month's collected total, a delta chip, "compared with September", and a monthly bar chart Jan–Dec with the current month highlighted. Empty state: "No revenue data yet".
+  - **Transactions table:** search ("Search transaction or customer"), an "All Status" filter, and columns Transaction, Customer (avatar, name, company/email), Plan/Type, Amount, Status (Successful/Pending/Failed), Timestamp, Action ("View More" goes to Transaction details). Footer shows "N transactions" with pagination. Empty state: "No transactions yet".
+  - **Withdraw** button in the header (absent in the empty state).
+- **Actions:** search, filter by status, paginate, open transaction details, open the Withdraw modal, Connect gateway.
+- **API:** `GET /api/admin/finance/summary`, `GET /api/admin/finance/revenue?year=`, `GET /api/admin/finance/transactions?q&status&page&limit`, `GET /api/admin/finance/gateways`.
+- **States:** skeleton loading per card, empty (designed), error banner with retry per card.
+
+### 3.5 Withdraw funds modal ✅
+- **Components:** "Available to withdraw" amount with a USD chip. Destination radio cards (PayPal / Paystack / Flutterwave). Amount input with a "$" prefix and "Use max". Destination account row (provider, account, "Connected"). Info line ("Funds usually arrive within 1–3 business days. Your remaining available balance will be $X"). Footer: "Secure withdrawal", Cancel, and **"Withdraw $X"** (the amount is live in the label).
+- **Validation:** amount > 0, amount ≤ available, destination connected.
+- **API:** `POST /api/admin/finance/withdrawals` (idempotency key, re-authentication recommended), `GET /api/admin/finance/withdrawals`.
+- **States:** submitting, success toast plus balance refresh, provider error.
+- ⚠️ This moves **real money** through provider transfer APIs. See decision D3.
+
+### 3.6 Transaction details ✅ (Successful variant)
+- **Components:** back arrow, "Transaction details", subtitle.
+  - **Summary card:** Amount paid, type ("Subscription payment"), TXN id, status chip, Plan/type, Timestamp.
+  - **Status banner:** "Payment successful" plus a description (variants needed for pending, failed and refunded).
+  - Note line: "Supplementary billing, payment, invoice and activity fields below are illustrative".
+  - **Customer and subscription:** avatar, name, email, billing email, billing frequency.
+  - **Payment and invoice:** method, state, provider, invoice number, invoice status, receipt row with "View invoice".
+  - **Amount breakdown:** subscription, discount, tax, total paid.
+  - **Transaction activity timeline:** initiated, authorised, successful, each with a timestamp.
+  - Footer: **Back**, **Initiate Refund**.
+- **API:** `GET /api/admin/finance/transactions/:id`, `POST /api/admin/finance/transactions/:id/refund`, `GET /api/admin/finance/transactions/:id/invoice`.
+- **Awaiting:** the Pending/Failed/Refunded variants, the refund confirmation dialog and the invoice view (or I follow the Successful layout with status-coloured banners; see Q list).
+
+### 3.7 Billing and Plans overview ✅
+- **Components:** header with a **Manage Plans** button.
+  - **Stat cards:** Total subscribers, Active subscriptions (% of all), MRR, Expired subscriptions (% of all).
+  - **Subscription Performance** area chart (active subscriptions over time) with a range dropdown ("Jan – Oct 2026"), the current value and the delta vs the previous month.
+  - **Subscribers by Plan:** total active, a segmented bar, and a per-plan count and %.
+  - **Subscribers table:** search (name, email, subscription ID) and filters for All plans, All status and Duration. Columns: Subscriber, Plan, Amount, Duration, Status, Next billing, Action ("View details" opens the modal). Pagination shows "Showing 1–7 of 1,284".
+- **API:** `GET /api/admin/billing/summary`, `GET /api/admin/billing/performance?from&to`, `GET /api/admin/billing/subscribers?q&plan&status&duration&page&limit`.
+- **States:** no empty-state frame received. I'll reuse the shared empty pattern unless you supply one.
+
+### 3.8 Subscriber details modal ✅
+- **Components:** avatar, name, company, email, status chip. Current plan card (plan, price/interval, billing interval and currency). Subscription information (ID, start date, current period, end date, next renewal, renewal setting). Payment method row (provider, account, "Recurring payment"). Recent billing table (Date, Invoice, Amount, Status) with "N payments". Footer: "Total paid to date" and **Done**.
+- **API:** `GET /api/admin/billing/subscribers/:id` (subscription plus the user's ledger entries).
+
+### 3.9 Manage Plans ✅
+- **Components:** back arrow, "Manage Plans".
+  - **Stat cards:** Total plans, Active plans, Draft plans ("Not yet published"), Archived plans ("Closed to new subscriptions").
+  - **All plans table:** search (name or identifier), All status and All billing cycles filters. Columns: Plan (name plus description), Monthly, Annual, Subscribers, Status, Amount generated.
+  - Plans shown: Developers, Pro, Pro +, Team Standard, Team Premium, Enterprise. These match the six canonical tiers.
+- **Actions implied:** none drawn (no row action, no "New plan" button).
+- **API:** `GET /api/admin/plans?q&status&cycle`, plus edit and status changes **if** a design is supplied (see D2).
+- **Awaiting:** the create/edit plan form, status-change and archive confirmation designs, if they exist.
+
+### 3.10 Dispute ✅ (populated and empty)
+- **Purpose:** review customer issues, gather evidence, resolve cases. Maps onto the existing **Support Center tickets** (`SupportTicket`): categories, statement, attachments, priority.
+- **Components:**
+  - **Stat cards:** Open cases (N new this week), Awaiting response (N due today), Disputed amount (% of monthly revenue), Resolution rate (+% vs last month).
+  - **Dispute queue:** tabs Open / In review / Resolved with counts. Cards show the ID, avatar, name, account type, category ("Billing & Payment/Duplicate Charge", "AI Agent not working"), and a priority chip (High/Medium/Low). "Prioritized by response deadline". Footer: "Showing 5 of 12 open cases" with pagination.
+  - **Case panel:** ID · category / subcategory, opened timestamp, status chip ("In review"). Customer statement. Evidence and attachments (file name, "Customer upload · size", download). Activity timeline. Actions: **Reply User**, **Mark as Solved**, **Initiate Refund**.
+  - **Empty state:** "No disputes yet" and "No case selected".
+- **API:** `GET /api/admin/disputes/summary`, `GET /api/admin/disputes?status&page`, `GET /api/admin/disputes/:id`, `POST /api/admin/disputes/:id/reply`, `PATCH /api/admin/disputes/:id/status`, `POST /api/admin/disputes/:id/refund`, `GET /api/admin/disputes/:id/attachments/:index` (authorised download).
+- Opening a case moves it to "In review" and records "Admin started reviewing the case" in the timeline. This matches the design's timeline.
+- **Awaiting:** the Reply User composer and refund confirmation designs (or I build them as standard modals in the shared style; see Q list).
+
+### 3.11 Insights ✅ (populated and empty)
+- **Stat cards:** Monthly active users (+%), Activation rate (+pp), Deployed projects (N this month), Revenue per user (+%).
+- **User Engagement:** yearly active users line chart (Jan–Dec), with an "Active users +14.6%" chip.
+- **Top Subscribed Plans:** per-plan bars with count and %, plus "Subscription grew this month".
+- **Most Used AI Agent:** a ranked bar list of models with count and % of the leader.
+- **Retention by signup cohort:** last 6 weekly cohorts. Columns are Signup week, Users and Wk1–Wk5 %, with heat-map shading and a legend.
+- **Empty states:** designed for every card.
+- **API:** `GET /api/admin/insights` (one payload) or one endpoint per card.
+- **Data dependencies:** MAU and retention need activity history (D4). "Most used AI agent" aggregates `AgentExecution.model` / AI sessions.
+
+### 3.12 Notification ❌
+- In the sidebar on every frame, with a bell badge in the top bar. No design received.
+- **Awaiting:** the notifications page and dropdown designs.
+
+### 3.13 Settings: General ✅
+- **Tabs:** General · Account · Security · AI Models.
+- **Platform details:** platform name, platform URL, support email, billing email.
+- **Security posture summary:** "Protected" chip, Enforce admin 2FA toggle ("Required for all N administrators"), session timeout, password minimum, special characters. "Manage →" opens the Security tab.
+- **Account and registration toggles:** Allow new registrations, Require email verification, Allow business account creation, Maintenance mode.
+- **Footer:** Cancel (reverts) and Save Changes.
+- **API:** `GET /api/admin/settings`, `PUT /api/admin/settings/general`.
+
+### 3.14 Settings: Account ✅
+- **Profile card:** avatar, name, email, **Update Profile Pic**. Fields for first name, last name and email address. Cancel / Save Changes.
+- **API:** reuse `PUT /api/auth/update-profile` and `POST /api/auth/upload-photo`. Changing the email needs re-verification (existing OTP flow).
+
+### 3.15 Settings: Security ✅
+- **Password card:** masked password with a reveal toggle, Cancel, **New Password**. Reuse `POST /api/auth/change-password`, which already bumps `tokenVersion`. The New Password form/modal is not drawn.
+- **Security Settings (platform policy):** Two-factor authentication ("Require all users to use 2FA"), Available 2FA methods (SMS / Authenticator App / Email chips), Minimum password length stepper, Require special characters, Require numerical figures. Cancel / Save Changes.
+- **API:** `PUT /api/admin/settings/security`. Enforcement goes in signup, change-password and reset (D5).
+
+### 3.16 Settings: AI Models ❌
+- The tab is visible in the General frame. No design received.
+
+### 3.17 Logout confirmation ✅
+- **Modal:** icon tile, "Log out of BuildrsHQ?", explanation, the admin identity card (initials, name, email · role), Cancel / **Log out**.
+- **Action:** clear the admin session client-side. Optionally offer "log out everywhere" (`POST /api/auth/logout-all`) if you want it.
+
+### 3.18 Navigation map
+
+```
+Sign-in ─► Overview
+Sidebar: Overview · Users · Finance · Billing Plans · Dispute · Insights · Notification · Settings · Logout(modal)
+Finance ─► Withdraw (modal)
+        └► Transaction details ─► Initiate Refund (confirm) ─► back
+Billing Plans ─► Subscriber details (modal)
+              └► Manage Plans ─► back
+Dispute ─► select case (in-page) ─► Reply / Mark solved / Refund
+Settings ─► General | Account | Security | AI Models (tabs, URL-addressable)
+General "Security posture › Manage" ─► Security tab
+Overview cards ─► respective sections (Users, Finance, Dispute)
+```
+
+---
+
+## 4. Proposed architecture
+
+### 4.1 Frontend: `/admin-panel`
+- **Same stack as `buildrs-frontend`** so nothing new is introduced: Next.js 15 (pages router), React 18, Tailwind 3.4, zustand, lucide-react. Charts are **hand-built SVG components** (line, area, bar, segmented bar, heat-map) instead of adding a chart library.
+- **Port** 3002. `/api/*` is rewritten to the backend (the same pattern as `buildrs-frontend/next.config.js`), so the browser only uses relative URLs.
+- **Structure:**
+  ```
+  admin-panel/
+    pages/  _app.js, login.js, index.js (overview), users/…, finance/index.js,
+            finance/transactions/[id].js, billing/index.js, billing/plans.js,
+            disputes.js, insights.js, notifications.js, settings/[tab].js
+    components/ layout/ (AdminShell, Sidebar, TopBar), ui/ (Card, StatCard, Button,
+            Toggle, Tabs, Table, Pagination, StatusPill, Modal, EmptyState, Skeleton,
+            SearchInput, FilterMenu, Avatar, Toast), charts/ (LineChart, AreaChart,
+            BarChart, SegmentedBar, HeatGrid), feature components per screen
+    lib/ api.js (fetch wrapper, envelope, 401/403 handling), format.js (money, dates, UTC)
+    store/ auth.js
+    styles/ globals.css (tokens copied from design-tokens.css)
+  ```
+- **Responsive:** the designs are 1440px desktop only. Proposal:
+  - ≥1280: as designed.
+  - 1024–1279: the stat grid goes 4→2 and side panels stack.
+  - <1024: the sidebar becomes an off-canvas drawer, tables scroll horizontally inside their card, modals go full-height, and the Dispute queue and case panel stack (the queue opens the case as a sheet).
+
+### 4.2 Backend: inside the existing architecture
+
+**Admin identity and authorisation**
+- Add `User.platformRole: null | 'admin' | 'super_admin'`. The default is `null`, so existing users are unaffected.
+- `middleware/platformAdmin.js`: `requirePlatformAdmin(...roles)` chains `authenticateToken`, then a fresh DB read of `platformRole` (short-TTL cache, invalidated on change). Non-admins get a 403. Destructive operations (refund, withdraw, settings, role changes) require `super_admin`.
+- Bootstrap the first super admin with `scripts/grant-platform-admin.js <email>` (same style as `scripts/upgrade-tier.js`). Admins are never self-assignable over HTTP.
+- `GET /api/admin/me` returns the admin identity for the shell.
+- Existing `x-admin-key` routes keep working unchanged (ops automation). Optionally they also accept a super-admin JWT.
+- `AdminAudit` gains `actorUserId` / `actorEmail`. Every mutating admin call is recorded.
+- A dedicated admin rate limiter (separate from the 10/15-min key limiter, which is far too low for a UI).
+
+**Routers** (flat, following `routes/*.js`, all mounted under `/api/admin`)
+- `routes/admin.js`: existing endpoints plus `/me`.
+- `routes/admin-overview.js`, `admin-users.js`, `admin-finance.js`, `admin-billing.js`, `admin-disputes.js`, `admin-insights.js`, `admin-settings.js`.
+- Aggregation logic lives in `utils/admin/*Service.js` so it can be unit-tested without HTTP.
+
+**New models (minimum required by the designs)**
+- `Payment`, the transaction ledger. Written from the **already-verified** webhook path (`server/routes/billing.js` and `applyWebhookEvent`, plus the legacy Paystack/Flutterwave/Stripe verify handlers). Fields: human ref (`TXN-#####`), invoice number, user, subscription, provider, provider refs (unique `providerEventId` for idempotency), plan, interval, amountMinor, currency, status (pending/successful/failed/refunded/partially_refunded), timeline[], refunds[].
+- `PlatformSettings`: a singleton document for general settings and security policy.
+- `PlanCatalog`: per-tier display name, description, status (active/draft/archived) and pricing, if D2 says plans become editable.
+- `Withdrawal`: if D3 approves payouts.
+- `UserActivityDay` `{ userId, day }` with a unique index, upserted at most once per user per day. Only if D4 approves.
+- `SupportTicket` additions: `disputedAmountMinor`, `paymentId`, `activity[]` (timeline), `firstReviewedAt`, and a dispute reference (`DSP-####`) shown in the UI.
+
+### 4.3 Testing strategy
+- Jest and Supertest suites for every admin router (`tests/admin-*.test.js`), covering auth (no token → 401, non-admin → 403, admin vs super_admin), validation, pagination bounds, and the envelope shape.
+- Ledger idempotency tests (webhook replays create one payment).
+- The existing test suite must stay green. The admin panel gets `next build` plus a lint check.
+- Manual end-to-end runs against a local MongoDB with a seed script (`scripts/seed-admin-demo.js`, dev only) to verify the populated and empty states visually against each screenshot.
+
+---
+
+## 5. Phased implementation plan
+
+Each phase ends with tests passing and a commit (or several).
+
+| Phase | Scope | Depends on |
+|---|---|---|
+| **A. Foundations** | `platformRole`, `requirePlatformAdmin`, `/api/admin/me`, audit actor fields, admin limiter, bootstrap script, tests. Scaffold `/admin-panel`: tokens, AdminShell (sidebar and top bar), UI kit, API client, auth store, login page, logout modal, routing guard. | D1 |
+| **B. Ledger** | `Payment` model plus recording hooks in the verified webhook paths, refund records, backfill script (optional), tests. | D3 (refund scope) |
+| **C. Finances** | Summary, revenue chart, transactions table (search, filter, pagination), transaction details page, invoice view, refund flow, gateway status card, empty/error states. Withdraw modal UI plus the backend per D3. | B |
+| **D. Billing and Plans** | Summary, performance chart, subscribers table and filters, subscriber details modal, Manage Plans (read, plus edit per D2). | B (for amount generated and recent billing) |
+| **E. Disputes** | Admin ticket queue and tabs, case panel, authorised attachment downloads, reply, status changes, timeline, refund linkage, stats. | B (refund), D6 |
+| **F. Insights** | Activity tracking (D4), MAU, activation, deployments, ARPU, engagement chart, plan mix, AI model usage, retention cohorts. | D4 |
+| **G. Settings** | General (`PlatformSettings` plus enforcement of registration, email verification and maintenance mode), Account (reuse profile endpoints), Security (password change reuse, policy enforcement per D5). | D5 |
+| **H. Overview, Users, Notification, AI Models** | Implemented **once designs arrive**. | your references |
+| **I. Integration and QA** | End-to-end pass on every screen and state, responsive pass, permission matrix tests, full regression of the existing suite, docs (`README` section plus `.env.example`). | all |
+
+---
+
+## 6. Decisions needed before implementation
+
+- **D1. Admin identity.** Proposed: `User.platformRole` (`admin` / `super_admin`) and the normal sign-in. The alternative is a separate `AdminUser` model like `SupportAgent`. Recommended: `platformRole`, because it reuses auth, liveness, bans and password policy.
+- **D2. Manage Plans editability.** Prices live in code (`Subscription.tierConfigs`, `buildrs-frontend/lib/plans.js`, regional pricing). Option (a): read-only catalogue with live stats, exactly as drawn. Option (b): an editable DB-backed catalogue. Option (b) must also change checkout, webhook amount validation and the pricing page so edits are real, which is a much larger and riskier change to billing. Recommended: (a) now and (b) once edit screens exist.
+- **D3. Money movement.** Refunds through Stripe, Paystack and Flutterwave refund APIs are well-scoped and recommended. **Withdrawals/payouts** (Paystack Transfers, Flutterwave Transfers) and **PayPal**, which is not integrated anywhere in the backend, are significant new financial integrations. Options: build them fully (needs credentials and recipient setup), or build the modal against provider balance reads and record withdrawal requests without executing transfers yet. Please confirm.
+- **D4. Activity tracking for MAU and retention.** Add a lightweight once-per-user-per-day upsert in the auth path (one indexed write per user per day), or approximate from `lastLogin` only (cannot produce weekly retention). Recommended: the daily upsert.
+- **D5. Platform security settings scope.** Saving the toggles is easy. **Enforcing** them means changing existing flows: password rules at signup/change, a registration gate, maintenance mode middleware, and session timeout. 2FA via an Authenticator App needs a TOTP implementation, and **SMS needs an SMS provider (none configured)**. Recommended: enforce password policy, registrations, email verification, maintenance mode and session timeout now. Ship 2FA with Email (existing OTP) plus Authenticator (TOTP, built with Node `crypto`, no new dependency). Leave SMS disabled until a provider is chosen.
+- **D6. Disputes and the Support console.** Is the admin Dispute screen the same queue the existing support agents work in `pages/support-admin.js`? Recommended: yes, the same `SupportTicket` data, with both consoles kept and status changes visible in both.
+- **D7. Which shell is canonical?** The Logout frame's background shows an older shell. I'll follow the 14-frame shell unless told otherwise.
+
+## 7. Design inconsistencies spotted (I'll follow your call)
+
+1. The sidebar label varies: "Billing Plans", "Billing and Plans" and "Billing Plan". The Account and Security settings frames omit Billing Plans entirely.
+2. Manage Plans says "Total plans 5" but lists 6. Annual prices are lower than monthly (for example Pro $20/mo, $10/yr), and every row repeats 1,243 subscribers and $20,000. I'll treat these as placeholder values and render live data.
+3. Subscribers by Plan lists "Pro, Pro +, Custom, Team", Insights lists "Business Plan, Pro, Pro +, Free", and the Subscribers table uses "Business". The backend tiers are Developer, Pro, Pro+, Team Standard, Team Premium and Enterprise. I'll use the real tier names.
+4. Transaction details shows "Payment method PayPal / Payment provider Stripe", but PayPal is not a supported rail.
+5. The Insights AI models (ChatGPT 5, Grok, Gemini, DeepSeek, Claude) differ from the configured OpenRouter models. I'll show whatever models were actually used.
+6. The x-axis reads "Doc" for December on the Billing chart. Every Dispute card reads "DSP-0248". The Account tab shows the email differently in the card and the field. These are typos/placeholders.
+7. The Dispute customer statement is signed "Daniel Uche" for Marcus Reed's case. Placeholder.
+
+## 8. Open questions about missing designs
+
+- Admin sign-in, Overview (current shell, populated and empty), Users (list and details), Notification, Settings › AI Models.
+- Transaction details for Pending, Failed and Refunded. Refund confirmation. Invoice view.
+- Billing overview empty state. Manage Plans create/edit/archive.
+- Dispute "Reply User" composer.
+- Connect gateway flow. Settings "New Password" form. Update profile picture flow.
+- Mobile and tablet layouts (otherwise I'll apply §4.1 responsive rules).

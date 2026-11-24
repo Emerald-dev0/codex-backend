@@ -57,6 +57,9 @@ const messagingRoutes = require('./routes/messaging');
 const meetingsRoutes = require('./routes/meetings');
 const profileRoutes = require('./routes/profile');
 const adminRoutes = require('./routes/admin');
+const adminAuthRoutes = require('./routes/admin-auth');
+const { requirePlatformAdmin, adminPanelLimiter } = require('./middleware/platformAdmin');
+const { maintenanceMode } = require('./middleware/maintenanceMode');
 const trialBillingRoutes = require('./routes/trial-billing');
 const paystackBillingRoutes = require('./routes/paystack-billing');
 const supportRoutes = require('./routes/support');
@@ -442,6 +445,10 @@ app.use(enforceSecurityHeaders());
 // Apply global rate limiter to all API routes
 app.use('/api', globalLimiter);
 
+// Admin › Settings › Maintenance mode (auth, admin, support and payment
+// webhooks stay reachable; see middleware/maintenanceMode.js).
+app.use('/api', maintenanceMode);
+
 // Serve uploaded files with proper headers. Mounted AFTER the security
 // headers above so uploads ship with CSP/nosniff/HSTS like everything else.
 // Anything that a browser will treat as active content is refused outright, so
@@ -489,6 +496,18 @@ app.use('/api/messaging', messagingRoutes);
 app.use('/api/meetings', meetingsRoutes);
 app.use('/api/profile', profileRoutes);
 app.use('/api/admin', adminRoutes);
+// Admin panel (/admin-panel). Every router below requires a platform admin
+// with a live admin session; money and settings writes additionally require
+// super_admin inside the router.
+app.use('/api/admin', adminPanelLimiter, adminAuthRoutes);
+app.use('/api/admin/overview', adminPanelLimiter, requirePlatformAdmin, require('./routes/admin-overview'));
+app.use('/api/admin/users', adminPanelLimiter, requirePlatformAdmin, require('./routes/admin-users'));
+app.use('/api/admin/finance', adminPanelLimiter, requirePlatformAdmin, require('./routes/admin-finance'));
+app.use('/api/admin/billing', adminPanelLimiter, requirePlatformAdmin, require('./routes/admin-billing'));
+app.use('/api/admin/disputes', adminPanelLimiter, requirePlatformAdmin, require('./routes/admin-disputes'));
+app.use('/api/admin/insights', adminPanelLimiter, requirePlatformAdmin, require('./routes/admin-insights'));
+app.use('/api/admin/settings', adminPanelLimiter, requirePlatformAdmin, require('./routes/admin-settings'));
+app.use('/api/admin/notifications', adminPanelLimiter, requirePlatformAdmin, require('./routes/admin-notifications'));
 app.use('/api/trial-billing', legacyBillingDeprecation('legacy trial billing API'), trialBillingRoutes);
 app.use('/api/paystack-billing', legacyBillingDeprecation('legacy Paystack billing API'), paystackBillingRoutes);
 app.use('/api/flutterwave-billing', legacyBillingDeprecation('legacy Flutterwave billing API'), flutterwaveBillingRoutes);

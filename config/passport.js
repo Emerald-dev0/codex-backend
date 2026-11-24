@@ -60,7 +60,12 @@ module.exports = function(passport) {
                     return done(null, user);
                 }
 
-                // Create new user
+                // Create new user (unless an admin closed registrations)
+                const { getSettings } = require('../utils/platformSettings');
+                const platformSettings = await getSettings();
+                if (!platformSettings.registration.allowRegistrations) {
+                    return done(null, false, { message: 'New registrations are currently closed.' });
+                }
                 user = await User.create({
                     googleId: profile.id,
                     email: email.toLowerCase(),

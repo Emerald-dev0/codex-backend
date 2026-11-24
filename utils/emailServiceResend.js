@@ -105,6 +105,45 @@ const sendOTPEmail = async (email, otp, fullName = 'User') => {
     }
 };
 
+// Send a sign-in (two-factor) code. Same transport/fallback rules as sendOTPEmail.
+const sendSignInCodeEmail = async (email, code, fullName = 'User', { context = 'BuildrsHQ' } = {}) => {
+    const RESEND_API_KEY = process.env.RESEND_API_KEY;
+    if (!RESEND_API_KEY) {
+        if (process.env.NODE_ENV === 'production') {
+            return { success: false, error: 'RESEND_API_KEY not configured' };
+        }
+        return sendMockOTP(email, code, fullName);
+    }
+    const emailData = {
+        from: process.env.EMAIL_FROM || DEFAULT_FROM,
+        to: [email],
+        subject: `Your ${context} sign-in code`,
+        html: renderEmail({
+            eyebrow: 'buildrs · sign-in',
+            title: `Hi ${fullName},`,
+            paragraphs: [
+                `Use the code below to finish signing in to <strong>${context}</strong>.`,
+            ],
+            code,
+            codeLabel: 'Sign-in code',
+            info: { label: 'Code expires in 10 minutes. Never share this code.' },
+            paragraphsAfter: [
+                'If you did not try to sign in, change your password immediately.',
+            ],
+        }),
+    };
+    try {
+        const response = await resendFetch(emailData, RESEND_API_KEY);
+        const result = await response.json();
+        if (response.ok) return { success: true, messageId: result.id, provider: 'resend' };
+        throw new Error(result.message || 'Failed to send email');
+    } catch (error) {
+        console.error('❌ Sign-in code email failed:', error.message);
+        if (process.env.NODE_ENV === 'production') return { success: false, error: error.message };
+        return sendMockOTP(email, code, fullName);
+    }
+};
+
 // Send welcome email
 const sendWelcomeEmail = async (email, fullName) => {
     const RESEND_API_KEY = process.env.RESEND_API_KEY;
@@ -461,6 +500,7 @@ const sendWaitlistReleaseEmail = async (email) => {
 
 module.exports = {
     sendOTPEmail,
+    sendSignInCodeEmail,
     sendWelcomeEmail,
     sendInvitationEmail,
     sendTrialWelcomeEmail,

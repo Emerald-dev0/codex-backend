@@ -419,6 +419,20 @@ export const authApi = {
       returnErrorData: true,
     }),
 
+  verifySignin2FA: (challengeToken, code) =>
+    apiFetch('/api/auth/signin/verify-2fa', {
+      method: 'POST',
+      body: JSON.stringify({ challengeToken, code }),
+      returnErrorData: true,
+    }),
+
+  resendSignin2FA: (challengeToken) =>
+    apiFetch('/api/auth/signin/resend-2fa', {
+      method: 'POST',
+      body: JSON.stringify({ challengeToken }),
+      returnErrorData: true,
+    }),
+
   getMe: () => apiFetch('/api/auth/me'),
 
   sendOTP: (email) =>

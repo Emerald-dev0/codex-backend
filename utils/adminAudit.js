@@ -25,6 +25,8 @@ async function recordAdminAction({ action, target = '', details = {}, req } = {}
     action,
     target: target ? String(target) : '',
     adminKeyFingerprint: adminKeyFingerprint(req),
+    actorUserId: req?.admin?.id || null,
+    actorEmail: req?.admin?.email || '',
     details: details || {},
     ip: requestIp(req),
   };

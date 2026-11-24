@@ -60,6 +60,19 @@ class StripeAdapter extends PaymentAdapter {
       currency: obj.currency ? String(obj.currency).toUpperCase() : null,
       amountMinor,
       amount: amountMinor == null ? null : amountMinor / 100,
+      // Payment-ledger facts (utils/paymentLedger). Not read by entitlements.
+      ledger: {
+        objectId: obj.id || null,
+        chargeId: obj.payment_intent || obj.charge || (event.type.startsWith('charge.') ? obj.id : null),
+        grossMinor: firstFinite(obj.amount_paid, obj.amount_total, obj.amount),
+        taxMinor: firstFinite(obj.tax, obj.total_details?.amount_tax),
+        discountMinor: firstFinite(obj.total_details?.amount_discount),
+        refundedMinor: firstFinite(obj.amount_refunded),
+        paymentMethod: obj.payment_method_types?.[0] || 'card',
+        customerEmail: obj.customer_email || obj.customer_details?.email || obj.billing_details?.email || null,
+        customerName: obj.customer_name || obj.customer_details?.name || obj.billing_details?.name || null,
+        failureReason: obj.last_finalization_error?.message || obj.failure_message || '',
+      },
     };
   }
 
@@ -81,6 +94,13 @@ class StripeAdapter extends PaymentAdapter {
     const session = await stripe.billingPortal.sessions.create({ customer: customerId, return_url: returnUrl });
     return { provider: 'stripe', url: session.url };
   }
+}
+
+function firstFinite(...values) {
+  for (const value of values) {
+    if (value != null && Number.isFinite(Number(value))) return Math.round(Number(value));
+  }
+  return null;
 }
 
 function stripeAmountMinor(obj) {

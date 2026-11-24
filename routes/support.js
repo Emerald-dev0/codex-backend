@@ -434,6 +434,16 @@ router.post('/tickets', supportTicketLimiter, receiveAttachments, async (req, re
 
         await ticket.save();
 
+        // Admin › Notification + Dispute queue (best-effort, never blocks).
+        require('../utils/adminNotifications').notifyAdmins({
+            type: 'dispute',
+            severity: ticket.priority === 'urgent' || ticket.priority === 'high' ? 'warning' : 'info',
+            title: `New case · ${ticket.referenceNumber || ticket.subject}`,
+            message: `${guestName || 'A customer'}: ${ticket.subject}`.slice(0, 300),
+            link: `/disputes?case=${ticket._id}`,
+            dedupeKey: `ticket:${ticket._id}`,
+        }).catch(() => {});
+
         res.json({
             success: true,
             ticketId: ticket.ticketId,

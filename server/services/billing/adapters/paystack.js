@@ -56,6 +56,16 @@ class PaystackAdapter extends PaymentAdapter {
       currency: d.currency ? String(d.currency).toUpperCase() : null,
       amountMinor: Number.isFinite(amountMinor) ? amountMinor : null,
       amount: Number.isFinite(amountMinor) ? amountMinor / 100 : null,
+      // Payment-ledger facts (utils/paymentLedger). Not read by entitlements.
+      ledger: {
+        objectId: d.id != null ? String(d.id) : null,
+        chargeId: d.transaction_reference || d.transaction?.reference || d.reference || null,
+        grossMinor: Number.isFinite(amountMinor) ? amountMinor : null,
+        paymentMethod: d.channel || d.authorization?.channel || '',
+        customerEmail: d.customer?.email || null,
+        customerName: [d.customer?.first_name, d.customer?.last_name].filter(Boolean).join(' ') || null,
+        failureReason: d.gateway_response && event.event !== 'charge.success' ? String(d.gateway_response) : '',
+      },
     };
   }
 

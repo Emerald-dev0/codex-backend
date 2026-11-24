@@ -179,3 +179,5 @@ router.get('/entitlements/:userId', adminLimiter, requireAdminKey, async (req, r
 });
 
 module.exports = router;
+// Shared with the admin panel (routes/admin-users.js) so both paths ban identically.
+module.exports.setBanned = setBanned;
