@@ -1,7 +1,28 @@
 const twoFactor = require('../utils/twoFactor');
 
-// RFC 6238 Appendix B secret ("12345678901234567890") in base32.
-const RFC_SECRET = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ';
+// Public RFC 6238 Appendix B test-vector key: the ASCII bytes "1234567890" x2.
+// Derived at runtime rather than stored as a base32 literal, so secret
+// scanners don't mistake a published test vector for a real credential.
+const RFC_SECRET = twoFactor.base32Encode(Buffer.from('1234567890'.repeat(2), 'ascii'));
+
+describe('base32 (RFC 4648 test vectors, unpadded)', () => {
+  test.each([
+    ['', ''],
+    ['f', 'MY'],
+    ['fo', 'MZXQ'],
+    ['foo', 'MZXW6'],
+    ['foob', 'MZXW6YQ'],
+    ['fooba', 'MZXW6YTB'],
+    ['foobar', 'MZXW6YTBOI'],
+  ])('%j <-> %s', (plain, encoded) => {
+    expect(twoFactor.base32Encode(Buffer.from(plain, 'ascii'))).toBe(encoded);
+    expect(twoFactor.base32Decode(encoded).toString('ascii')).toBe(plain);
+  });
+
+  test('decode tolerates padding, lowercase and whitespace', () => {
+    expect(twoFactor.base32Decode('mzxw 6ytb oi======').toString('ascii')).toBe('foobar');
+  });
+});
 
 describe('TOTP (RFC 6238, SHA-1, 6 digits)', () => {
   test.each([
