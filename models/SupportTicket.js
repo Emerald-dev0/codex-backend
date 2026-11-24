@@ -79,6 +79,23 @@ const supportTicketSchema = new mongoose.Schema({
         }
     }],
     tags: [String],
+    // ---- Admin › Dispute case management ----------------------------------
+    // Human case number shown in the admin queue (DSP-0248). Assigned lazily
+    // by utils/admin/disputeService so legacy tickets get one on first view.
+    disputeNumber: { type: String, unique: true, sparse: true },
+    // Optional finer-grained reason chosen by staff ("Duplicate Charge").
+    subcategory: { type: String, default: '', maxlength: 120 },
+    disputedAmountMinor: { type: Number, default: 0, min: 0 },
+    disputedCurrency: { type: String, default: 'USD' },
+    paymentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Payment', default: null },
+    reviewStartedAt: { type: Date, default: null },
+    reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    activity: [{
+        type: { type: String },
+        message: String,
+        actorName: String,
+        at: { type: Date, default: Date.now }
+    }],
     createdAt: {
         type: Date,
         default: Date.now
@@ -106,5 +123,6 @@ supportTicketSchema.pre('save', function(next) {
 supportTicketSchema.index({ userId: 1, status: 1, updatedAt: -1 });
 supportTicketSchema.index({ status: 1, updatedAt: -1 });
 supportTicketSchema.index({ assignedTo: 1, status: 1 });
+supportTicketSchema.index({ createdAt: -1 });
 
 module.exports = mongoose.model('SupportTicket', supportTicketSchema);

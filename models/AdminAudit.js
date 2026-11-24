@@ -5,6 +5,10 @@ const adminAuditSchema = new mongoose.Schema(
     action: { type: String, required: true, index: true },
     target: { type: String, default: '', index: true },
     adminKeyFingerprint: { type: String, default: '' },
+    // Set when the action came from a signed-in platform admin (admin panel)
+    // rather than the static x-admin-key.
+    actorUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    actorEmail: { type: String, default: '' },
     details: { type: mongoose.Schema.Types.Mixed, default: {} },
     ip: { type: String, default: '' },
     expiresAt: {

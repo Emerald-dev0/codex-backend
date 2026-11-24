@@ -43,9 +43,25 @@ const userSchema = new mongoose.Schema({
         type: Date,
         default: null
     },
+    // Platform (BuildrsHQ staff) role for the admin panel. Distinct from
+    // workspace/company roles. Never self-assignable over HTTP: granted by
+    // scripts/grant-platform-admin.js or by an existing super admin.
+    platformRole: {
+        type: String,
+        enum: ['admin', 'super_admin'],
+        default: undefined
+    },
     banReason: {
         type: String,
         default: ''
+    },
+    // Two-factor authentication (Admin › Settings › Security). Secrets are
+    // AES-GCM encrypted (utils/secretCrypto) and never selected by default.
+    twoFactor: {
+        totpEnabled: { type: Boolean, default: false },
+        totpSecret: { type: String, select: false },
+        totpPendingSecret: { type: String, select: false },
+        totpEnabledAt: { type: Date },
     },
     googleId: {
         type: String,
@@ -191,5 +207,8 @@ userSchema.pre('save', async function(next) {
 userSchema.methods.comparePassword = async function(candidatePassword) {
     return await bcrypt.compare(candidatePassword, this.password);
 };
+
+userSchema.index({ platformRole: 1 }, { sparse: true });
+userSchema.index({ createdAt: -1 });
 
 module.exports = mongoose.model('User', userSchema);
