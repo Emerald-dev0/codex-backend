@@ -5,6 +5,7 @@ import { BarRow, LineChart } from '../components/charts';
 import { adminApi } from '../lib/api';
 import useAsync from '../lib/useAsync';
 import { MONTH_LABELS, compact, money, number, pct } from '../lib/format';
+import { PLAN_OPTIONS } from '../lib/plans';
 
 const PLAN_COLORS = ['#12dce5', '#a78bfa', '#3a6b8a', '#59687a', '#2a7f86', '#8a38f5'];
 const AGENT_COLORS = ['#12dce5', '#12dce5', '#239aa1', '#2a6f7a', '#2a5a6a'];
@@ -87,7 +88,7 @@ export default function InsightsPage() {
               {!d ? <Skeleton className="h-[200px] w-full" /> : (
                 <>
                   <div className="space-y-6">
-                    {(d.topPlans.plans.length ? d.topPlans.plans : [{ tier: 'none', label: 'Developer', count: 0, pct: 0 }]).slice(0, 5).map((p, i) => (
+                    {(d.topPlans.plans.length ? d.topPlans.plans : PLAN_OPTIONS.slice(0, 4).map((p) => ({ tier: p.value, label: p.label, count: 0, pct: 0 }))).slice(0, 5).map((p, i) => (
                       <BarRow key={p.tier} label={p.label} value={d.topPlans.total ? `${number(p.count)} · ${pct(p.pct, 0)}` : '0'} pct={p.pct} color={PLAN_COLORS[i % PLAN_COLORS.length]} />
                     ))}
                   </div>

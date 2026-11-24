@@ -55,7 +55,7 @@ export default function UsersPage() {
           loading={!s}
           label="Suspended"
           value={s && number(s.suspended.count)}
-          delta={s && <Delta value={s.unverified.count ? `${number(s.unverified.count)} unverified` : ''} label={s.unverified.count ? 'awaiting email verification' : 'No unverified accounts'} tone="warn" arrow={false} />}
+          delta={s && <Delta value={s.unverified.count ? `${number(s.unverified.count)} unverified` : ''} label={s.unverified.count ? 'awaiting email verification' : s.suspended.count ? 'Access revoked by an admin' : 'No suspended accounts'} tone="warn" arrow={false} />}
         />
       </div>
       {summary.error && <p className="mt-3 text-[13px] text-[#ff8a8a]">Could not load user metrics. <button type="button" className="link" onClick={summary.reload}>Retry</button></p>}

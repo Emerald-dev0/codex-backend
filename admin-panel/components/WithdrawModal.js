@@ -6,10 +6,22 @@ import { adminApi } from '../lib/api';
 import { idempotencyKey, money, toMinor } from '../lib/format';
 import { toast } from '../store/toast';
 
+function currencySymbol(currency) {
+  try {
+    return new Intl.NumberFormat('en-US', { style: 'currency', currency, currencyDisplay: 'narrowSymbol' })
+      .formatToParts(0).find((p) => p.type === 'currency')?.value || currency;
+  } catch {
+    return currency;
+  }
+}
+
 export default function WithdrawModal({ open, onClose, gateways, onDone, canWithdraw }) {
   const view = gateways;
   const options = useMemo(() => (view?.gateways || []), [view]);
-  const firstReady = options.find((g) => g.configured && g.supported !== false && g.payout.configured);
+  const isReady = (g) => g.configured && g.supported !== false && g.payout.configured && !g.error;
+  // Default to a ready gateway that actually holds funds.
+  const funded = (g, cur) => isReady(g) && g.balances.some((b) => b.availableMinor > 0 && (!cur || b.currency === cur));
+  const firstReady = options.find((g) => funded(g, view?.currency || 'USD')) || options.find((g) => funded(g)) || options.find(isReady);
   const [provider, setProvider] = useState(firstReady?.id || options[0]?.id || '');
   const [amount, setAmount] = useState('');
   const [error, setError] = useState('');
@@ -19,6 +31,7 @@ export default function WithdrawModal({ open, onClose, gateways, onDone, canWith
   useEffect(() => {
     if (open) {
       setProvider(firstReady?.id || options[0]?.id || '');
+      setChosenCurrency('');
       setAmount('');
       setError('');
       setKey(idempotencyKey());
@@ -26,8 +39,12 @@ export default function WithdrawModal({ open, onClose, gateways, onDone, canWith
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  const currency = view?.currency || 'USD';
+  const reporting = view?.currency || 'USD';
   const gateway = options.find((g) => g.id === provider);
+  // A gateway can hold several currencies (e.g. Paystack in NGN); withdraw in one of them.
+  const currencies = gateway?.balances.map((b) => b.currency) || [];
+  const [chosenCurrency, setChosenCurrency] = useState('');
+  const currency = currencies.includes(chosenCurrency) ? chosenCurrency : (currencies.includes(reporting) ? reporting : currencies[0] || reporting);
   const balance = gateway?.balances.find((b) => b.currency === currency);
   const available = balance?.availableMinor || 0;
   const minor = toMinor(amount);
@@ -72,7 +89,18 @@ export default function WithdrawModal({ open, onClose, gateways, onDone, canWith
             <p className="text-[12px] text-figma-text-soft">Available to withdraw</p>
             <p className="mt-1 text-[28px] font-semibold text-white">{money(available, currency)}</p>
           </div>
-          <span className="rounded bg-[#1d263b] px-2.5 py-1 text-[12px] text-figma-text-soft">{currency}</span>
+          {currencies.length > 1 ? (
+            <select
+              aria-label="Withdrawal currency"
+              className="rounded bg-[#1d263b] px-2.5 py-1 text-[12px] text-figma-text-soft focus:outline-none focus:ring-1 focus:ring-figma-accent/50"
+              value={currency}
+              onChange={(e) => { setChosenCurrency(e.target.value); setAmount(''); setError(''); }}
+            >
+              {currencies.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
+          ) : (
+            <span className="rounded bg-[#1d263b] px-2.5 py-1 text-[12px] text-figma-text-soft">{currency}</span>
+          )}
         </div>
 
         <p className="mb-3 mt-6 text-[15px] font-medium text-white">Withdrawal destination</p>
@@ -106,7 +134,7 @@ export default function WithdrawModal({ open, onClose, gateways, onDone, canWith
 
         <Field label="Amount" className="mt-6">
           <div className="relative">
-            <span className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-[16px] text-figma-text-soft">$</span>
+            <span className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-[16px] text-figma-text-soft">{currencySymbol(currency)}</span>
             <input
               className="input h-12 pl-9 pr-24 text-[16px]"
               inputMode="decimal"
@@ -114,7 +142,7 @@ export default function WithdrawModal({ open, onClose, gateways, onDone, canWith
               value={amount}
               onChange={(e) => setAmount(e.target.value.replace(/[^\d.,]/g, ''))}
               disabled={Boolean(blocker)}
-              aria-label="Amount in US dollars"
+              aria-label={`Amount in ${currency}`}
             />
             <button
               type="button"
