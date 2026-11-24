@@ -49,6 +49,16 @@ router.post('/create', authenticateToken, permissionMatrix.requirePermission('co
             });
         }
         
+        // Admin › Settings › "Allow business account creation".
+        const platformSettings = await require('../utils/platformSettings').getSettings();
+        if (platformSettings.registration?.allowBusinessAccounts === false) {
+            return res.status(403).json({
+                success: false,
+                message: 'Creating new company workspaces is temporarily disabled.',
+                code: 'BUSINESS_ACCOUNTS_DISABLED'
+            });
+        }
+
         // Check user's subscription
         const subscription = await Subscription.findOne({ userId: req.userId });
         const companyTier = canonicalTier(subscription?.tier);

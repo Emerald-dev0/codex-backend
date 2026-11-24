@@ -226,6 +226,14 @@ const authenticateToken = async (req, res, next) => {
         return res.status(403).json({ success: false, message: 'Token has been revoked. Please sign in again.' });
     }
 
+    // Daily-active marker for admin Insights (bounded, fire-and-forget).
+    try {
+        // Staff time in the admin panel is not product engagement.
+        if (user.scope !== 'admin') require('../utils/activityTracker').touch(userId);
+    } catch {
+        // Tracking must never affect authentication.
+    }
+
     req.userId = userId;
     req.user = {
         ...user,

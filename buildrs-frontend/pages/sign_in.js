@@ -21,6 +21,10 @@ export default function SignIn() {
   const [rateLimited, setRateLimited] = useState(false);
   const [platformStats, setPlatformStats] = useState(null);
   const [statsLoading, setStatsLoading] = useState(true);
+  // Second factor (required by platform security settings or an enrolled authenticator).
+  const [challenge, setChallenge] = useState(null);
+  const [code, setCode] = useState('');
+  const [resending, setResending] = useState(false);
   const setAuth = useAuthStore((s) => s.setAuth);
   const toast = useToastStore();
 
@@ -54,6 +58,56 @@ export default function SignIn() {
     return () => clearInterval(interval);
   }, [fetchPlatformStats]);
 
+  const finishSignin = (result) => {
+    resetRateLimit('signin');
+    setAuth(result.token, result.user);
+    // Invitation links bounce here first (?redirect=...): honor relative
+    // redirects only, never absolute URLs (open-redirect guard).
+    const redirect = router.query.redirect;
+    if (typeof redirect === 'string' && redirect.startsWith('/') && !redirect.startsWith('//')) {
+      router.push(redirect);
+    } else if (result.user?.onboardingCompleted) {
+      router.push('/dashboard');
+    } else {
+      router.push('/onboarding');
+    }
+  };
+
+  const handleVerifyCode = async (e) => {
+    e.preventDefault();
+    setError('');
+    if (!/^\d{6}$/.test(code.trim())) { setError('Enter the 6-digit code'); return; }
+    setLoading(true);
+    try {
+      const result = await authApi.verifySignin2FA(challenge.token, code.trim());
+      if (result.success && result.token) {
+        finishSignin(result);
+      } else {
+        setError(result.message || 'Verification failed');
+        if (result.code === 'CHALLENGE_INVALID') setChallenge(null);
+      }
+    } catch (err) {
+      setError(err.data?.message || err.message || 'Verification failed');
+      if (err.data?.code === 'CHALLENGE_INVALID') setChallenge(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleResendCode = async () => {
+    setError('');
+    setResending(true);
+    try {
+      const result = await authApi.resendSignin2FA(challenge.token);
+      if (result.success) toast.success(`A new code was sent to ${result.destination}`);
+      else setError(result.message || 'Could not resend the code');
+    } catch (err) {
+      setError(err.data?.message || err.message || 'Could not resend the code');
+    } finally {
+      setResending(false);
+    }
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
@@ -75,19 +129,11 @@ export default function SignIn() {
     setLoading(true);
     try {
       const result = await authApi.signin(email, password);
-      if (result.success && result.token) {
-        resetRateLimit('signin');
-        setAuth(result.token, result.user);
-        // Invitation links bounce here first (?redirect=...): honor relative
-        // redirects only, never absolute URLs (open-redirect guard).
-        const redirect = router.query.redirect;
-        if (typeof redirect === 'string' && redirect.startsWith('/') && !redirect.startsWith('//')) {
-          router.push(redirect);
-        } else if (result.user?.onboardingCompleted) {
-          router.push('/dashboard');
-        } else {
-          router.push('/onboarding');
-        }
+      if (result.success && result.requires2FA) {
+        setChallenge({ token: result.challengeToken, method: result.method, destination: result.destination });
+        setCode('');
+      } else if (result.success && result.token) {
+        finishSignin(result);
       } else if (result.requiresVerification) {
         toast.info(result.message || 'Please verify your email. Sending code...');
         sessionStorage.setItem('userEmail', result.email || email);
@@ -205,6 +251,52 @@ export default function SignIn() {
               <span>or continue with email</span>
             </div>
 
+            {challenge ? (
+            <form onSubmit={handleVerifyCode} noValidate>
+              {error && (
+                <div className="mb-4 p-3 rounded" style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.5)', color: '#ec8f8f', fontSize: '14px' }}>
+                  {error}
+                </div>
+              )}
+              <p style={{ color: 'rgba(255,255,255,0.7)', fontSize: '14px', marginBottom: '16px' }}>
+                {challenge.method === 'authenticator'
+                  ? 'Enter the 6-digit code from your authenticator app.'
+                  : `We sent a 6-digit code to ${challenge.destination}.`}
+              </p>
+              <div className="form-group">
+                <label htmlFor="code" className="form-label">VERIFICATION CODE</label>
+                <input
+                  id="code"
+                  type="text"
+                  inputMode="numeric"
+                  className="input-base"
+                  placeholder="123456"
+                  value={code}
+                  onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  autoComplete="one-time-code"
+                  autoFocus
+                  required
+                />
+              </div>
+              <button type="submit" className="btn-gradient" disabled={loading}>
+                {loading ? (
+                  <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full" style={{ animation: 'spin 1s linear infinite' }} />
+                ) : (
+                  <>Verify →</>
+                )}
+              </button>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '12px', fontSize: '13px' }}>
+                <button type="button" className="forgot-password" style={{ background: 'none', border: 0, cursor: 'pointer' }} onClick={() => { setChallenge(null); setError(''); }}>
+                  ← Use a different account
+                </button>
+                {challenge.method === 'email' && (
+                  <button type="button" className="forgot-password" style={{ background: 'none', border: 0, cursor: 'pointer' }} onClick={handleResendCode} disabled={resending}>
+                    {resending ? 'Sending…' : 'Resend code'}
+                  </button>
+                )}
+              </div>
+            </form>
+            ) : (
             <form onSubmit={handleSubmit} noValidate>
               {error && (
                 <div className="mb-4 p-3 rounded" style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.5)', color: '#ec8f8f', fontSize: '14px' }}>
@@ -254,6 +346,7 @@ export default function SignIn() {
                 )}
               </button>
             </form>
+            )}
 
             <Link href="/support" className="support-link">
               Support agent? Sign in here →
