@@ -11,6 +11,7 @@ const { routeProvider, getAdapter } = require('../services/billing/paymentRouter
 const entitlementService = require('../services/billing/entitlementService');
 const { nearestEdge } = require('../services/billing/edgeRouter');
 const { resolvePrice } = require('../../config/regionalPricing');
+const paymentLedger = require('../../utils/paymentLedger');
 
 const router = express.Router();
 
@@ -78,6 +79,13 @@ router.post('/webhook/:provider', async (req, res) => {
       req.headers['stripe-signature'] || req.headers['x-paystack-signature'] || req.headers['verif-hash'];
     const normalized = await adapter.verifyWebhook({ rawBody, signature, headers: req.headers });
     normalized.provider = provider;
+    // Ledger first: a verified charge is money received even if the
+    // entitlement step later rejects it (e.g. amount mismatch). Never fatal.
+    try {
+      await paymentLedger.recordFromWebhook(normalized);
+    } catch (ledgerError) {
+      console.error('[billing] ledger write failed:', ledgerError.message);
+    }
     const outcome = await entitlementService.applyWebhookEvent(normalized);
     if (!outcome.applied) {
       // Idempotent replay or unmapped type: answer 200 with current state.
