@@ -1,0 +1,65 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Design tokens (mirrors buildrs-frontend/styles/design-tokens.css --figma-*). */
+:root {
+  --figma-bg: #0f131c;
+  --figma-deep: #0a0d15;
+  --figma-raised: #1d263b;
+  --figma-accent: #12dce5;
+  --figma-text-muted: #9aaeba;
+  --figma-border: rgba(255, 255, 255, 0.1);
+  --shell-topbar: 96px;
+  --shell-sidebar: 242px;
+  color-scheme: dark;
+}
+
+html, body {
+  background: var(--figma-bg);
+  color: #fff;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+* { scrollbar-color: #1d263b transparent; scrollbar-width: thin; }
+
+@layer components {
+  .card {
+    @apply rounded-lg border border-white/10 bg-[#0a0d15];
+  }
+  .card-pad { @apply p-5; }
+  .eyebrow {
+    @apply text-[12px] font-semibold uppercase tracking-[0.22em] text-figma-accent;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-5 h-11 text-[15px] font-medium transition-colors
+      disabled:cursor-not-allowed disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-figma-accent/60;
+  }
+  .btn-primary {
+    @apply btn bg-figma-accent text-[#04161a] hover:bg-[#3fe6ee] shadow-[0_0_24px_rgba(18,220,229,0.25)];
+  }
+  .btn-secondary {
+    @apply btn border border-white/15 bg-[#151c2b] text-white hover:bg-[#1d263b];
+  }
+  .btn-danger {
+    @apply btn bg-[#ec1414] text-white hover:bg-[#d61111];
+  }
+  .btn-sm { @apply h-9 px-3 text-[13px]; }
+  .input {
+    @apply w-full rounded-lg border border-white/15 bg-[#070a10] px-3 h-10 text-[15px] text-white placeholder:text-figma-text-faint
+      focus:border-figma-accent/70 focus:outline-none focus:ring-1 focus:ring-figma-accent/40 disabled:opacity-60;
+  }
+  .label { @apply mb-2 block text-[15px] text-white; }
+  .link { @apply text-figma-accent hover:text-figma-accent-bright font-medium; }
+  .th { @apply px-3 py-2.5 text-left text-[15px] font-normal uppercase text-figma-text-muted whitespace-nowrap; }
+  .td { @apply px-3 py-4 text-[15px] text-white align-middle; }
+}
+
+@keyframes shimmer { 0% { background-position: -400px 0; } 100% { background-position: 400px 0; } }
+.skeleton {
+  background: linear-gradient(90deg, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.09) 50%, rgba(255,255,255,0.04) 100%);
+  background-size: 800px 100%;
+  animation: shimmer 1.4s infinite linear;
+  border-radius: 6px;
+}
