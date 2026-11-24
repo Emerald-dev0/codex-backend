@@ -21,8 +21,7 @@ import Sidebar from '../components/Sidebar';
 import AuthGuard from '../components/AuthGuard';
 import useAuthStore from '../store/authStore';
 import { useCurrentCompany } from '../hooks/useCurrentCompany';
-import { agentApi, apiFetch } from '../lib/api';
-import { useCachedData } from '../hooks/useCachedData';
+import { apiFetch } from '../lib/api';
 import s from '../styles/AiAgents.module.css';
 
 const MODEL_PREFERENCE_KEY = 'buildrs-ai-model-preference';
@@ -1010,20 +1009,48 @@ function AiAgentsPage() {
   const [tab, setTab] = useState('terminal');
   const activeTab = ['terminal', 'diff', 'validation'].includes(tab) ? tab : 'terminal';
 
-  const {
-    data: sessions,
-    loading: loadingSessions,
-    refresh: refreshSessions,
-  } = useCachedData(userId, 'ai-sessions', async () => {
-    const data = await Promise.race([
-      agentApi.sessions(),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('Provider request timed out')), 8000))
-    ]);
-    return { success: true, data: Array.isArray(data.sessions) ? data.sessions : [] };
-  }, { refreshOnVisibility: true, intervalMs: 15000 });
-
+  const [sessions, setSessions] = useState([]);
+  const [loadingSessions, setLoadingSessions] = useState(true);
   const [loadError, setLoadError] = useState('');
-  const [actionError, setActionError] = useState('');
+
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const data = await Promise.race([
+          apiFetch('/api/v1/agent/sessions'),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Request timed out')), 8000))
+        ]);
+        if (!active) return;
+        if (data.success && Array.isArray(data.sessions)) {
+          setSessions(data.sessions);
+        } else {
+          setSessions([]);
+        }
+      } catch (err) {
+        if (!active) return;
+        console.error('Failed to load agent sessions:', err.message);
+        setSessions([]);
+      } finally {
+        if (active) setLoadingSessions(false);
+      }
+    })();
+    return () => { active = false; };
+  }, []);
+
+  const refreshSessions = async () => {
+    try {
+      const data = await Promise.race([
+        apiFetch('/api/v1/agent/sessions'),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Request timed out')), 8000))
+      ]);
+      if (data.success && Array.isArray(data.sessions)) {
+        setSessions(data.sessions);
+      }
+    } catch {
+      // keep previous data on error
+    }
+  };
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
   const [search, setSearch] = useState('');
